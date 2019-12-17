@@ -38,9 +38,13 @@ TRACELOG=/tmp/awld.log # output useful for debugging awld goes here (rotated)
 
 STORAGE_TYPES="ssd|hdd|none" # supported storage types
 
-INSTANCE_TYPES_SSD="m5ad.4xlarge r5dn.4xlarge r5d.4xlarge m5dn.4xlarge m5d.4xlarge r5ad.4xlarge"
-INSTANCE_TYPES_HDD="h1.4xlarge d2.2xlarge"
-INSTANCE_TYPE_ZK="a1.large"
+declare -Ar INSTANCE_TYPES=(
+    [ssd]="m5ad.4xlarge r5dn.4xlarge r5d.4xlarge\
+           m5dn.4xlarge m5d.4xlarge r5ad.4xlarge"
+    [hdd]="h1.4xlarge d2.2xlarge"
+    [zk]="a1.large"
+    [admin]="t2.medium"
+)
 
 DEFAULT_SFR_MAXPRICE="0.50"  # default maximum spot instance price per hour
 DEFAULT_SFR_DURATION="1day" # default duration of spot requests for nodes
@@ -51,10 +55,11 @@ ZOOCFG="/opt/zookeeper/conf/zoo.cfg" # path to ZK config file on ZK instance
 ZK_ENSEMBLE_SIZE=3 # target number of instances in LD Zookeeper ensemble
 ZK_CLIENT_TIMEOUT="30s" # ZK client timeout value to put in cluster config
 
-#ZKIIDS=     # instance ids of currently provisioned Zookeeper ensemble. 
-#NZKINST=    # number of instance ids in $ZKIIDS. This may be smaller than
-             # ZK_ENSEMBLE_SIZE. Both NZKINST and ZKIIDS get initialized
-             # right before the execution of commands that need them.
+# This map describes the provisioned instances of shared services, grouped by
+# service type. [zk] for Zookeeper, [admin] for the monitoring and
+# administration instance, [bench] for the load generator.  The values
+# are space-separated lists of EC2 instance ids.
+declare -A IIDS=([zk]= [admin]= [bench]=)
 
 # LogDevice server ports
 PORT_CLIENT=16001
@@ -89,28 +94,30 @@ export AWS_DEFAULT_OUTPUT=text
 # The keys are command names, the values are attributes. Multiple attributes
 # may be specified, separated by newlines. The first line contains a short
 # description of the command that 'help' prints. The only other supported
-# attribute is currently 'needs-ZKIIDS', which indicates that ZKIIDS and
-# NZKINST globals must be initialized (and errors handled) before running the
-# command.
+# attribute currently is the space-separated set of infrastructure components
+# required by the command. The format is "find-zk find-admin find-bench",
+# which indicates that IIDS[zk], IIDS[admin], or IIDS[bench] respectively must
+# be initialized (and errors handled) before running the command.
 #
 declare -A COMMANDS=(
     [allocate]="create new LogDevice nodes by requesting instances from EC2"
+    [allocate-zk]="create up to $ZK_ENSEMBLE_SIZE instances for the shared Zookeeper ensemble
+                   find-zk"
+    [allocate-admin]="create an instance for monitoring and configuration
+              find-admin"
     [list]="list the attributes of all currently allocated LogDevice nodes"
+    [list-zk]="list running Zookeeper instances"
     [terminate]="terminate EC2 instances and spot requests for a cluster"
     [config]="create and store, or retrieve a cluster configuration file
-              needs-ZKIIDS"
+              find-zk"
     [start]="start logdeviced on one, several, or all nodes in a cluster
-             needs-ZKIIDS"
+              find-zk"
+    [start-zk]="start all Zookeeper instances previously created by allocate-zk
+              find-zk"    
     [stop]="stop logdeviced on one, several, or all nodes in a cluster"
+    [stop-zk]="stop all Zookeeper instances, terminate zookeeper daemons
+              find-zk"
     [status]="check whether logdeviced is running"
-    [zkcreate]="allocate and provision a Zookeeper ensemble for LogDevice
-                needs-ZKIIDS"
-    [zkstart]="start all Zookeeper instances previously provisioned by zkcreate
-               needs-ZKIIDS"
-    [zkstop]="stop all Zookeeper instances, terminate zookeeper daemons
-              needs-ZKIIDS"
-    [zklist]="list running Zookeeper instances
-              needs-ZKIIDS"
     [help]="print help"
 )
 
@@ -227,29 +234,42 @@ next_to_last_line() {
 }
 
 
-# For each Zookeeper EC2 instance previously created by 'zkcreate' and
+# Returns the number of instances of shared service of type $1,
+# which must be one of the keys of ${IIDS[]} map.
+ninst() {
+    if [[ ${IIDS[$1]+_} ]]; then    #key exists
+	echo "${IIDS[$1]}" | wc -w
+    else
+	2> echo "ABORT: invalid shared service type $1 in $FUNCNAME"
+	exit 1
+    fi
+}
+
+
+# For each Zookeeper EC2 instance previously created by allocate-zk and
 # currently in state 'running' output a row in the following format:
 #      private-ip public-dns-name instance-id
 # sorted alphabetically by instance id, ascending
 # The result may be empty.
-zk_instances() {
-    aws ec2 describe-instances --instance-ids $ZKIIDS \
-	--filter 'Name=instance-state-name,Values=running' \
+zk_running() {
+    aws ec2 describe-instances \
+	--filters "Name=tag:logdevice-zk,Values="\
+	          'Name=instance-state-name,Values=running' \
 	--query\
      "Reservations[].Instances[].[InstanceId,PrivateIpAddress,PublicDnsName]"\
 	--output text | sort
 }
 
 
-# Read the output of zk_instances() from stdin and output a string of
+# Read the output of zk_running() from stdin and output a string of
 # comma separated <private-ip>:<zk-client-port> entries suitable for use
 # by Zookeeper clients.
 #
 # Set $? to 0 if the number of input entries equals the number of Zookeeper
-# instance ids in $ZKIIDS (all privisioned ZK instances are running). Otherwise
-# set $? to 1.
+# instance ids in ${IIDS[zk]} (all privisioned ZK instances are running).
+# Otherwise set $? to 1.
 zk_client_config() {
-    awk -v cport=$ZKCLTPORT -v nzk=$NZKINST \
+    awk -v cport=$ZKCLTPORT -v nzk=$(ninst zk) \
 	'{printf "%s%s:%s", sep, $2, cport ; sep=","}
         END{if (NR>0) print "" ; exit (NR==nzk ? 0 : 1)}'
 }
@@ -548,8 +568,7 @@ spot_fleet_request() {
     fi
     
     case $storage in
-	ssd) instance_types=$INSTANCE_TYPES_SSD ;;
-	hdd) instance_types=$INSTANCE_TYPES_HDD ;;
+	ssd|hdd) instance_types=${INSTANCE_TYPES[$storage]} ;;
 	none) >&2 echo "ABORT: allocating sequencer-only nodes requested,"\
 		"but is not yet supported in $FUNCNAME" ; exit 1 ;;
 	*) >&2 echo "ABORT: invalid storage type '$storage' in $FUNCNAME" ;
@@ -923,8 +942,8 @@ config() {
   config         
 
   create and store, or retrieve a cluster configuration file the file
-  is stored in a Zookeeper ensemble previously started by
-  'zkstart'. The znode path is /conf/<cluster-name>.conf
+  is stored in a Zookeeper ensemble previously started by start-zk. 
+  The znode path is /conf/<cluster-name>.conf
 
   FLAGS
     -c|--cluster <cluster-name>   REQUIRED 
@@ -961,7 +980,7 @@ EOF
 	prettyprinter="cat"
     fi
 
-    zkhosts=$(zk_instances)
+    zkhosts=$(zk_running)
     if [ $? -ne 0 ]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
@@ -969,14 +988,14 @@ EOF
     zookeeper=$(echo "$zkhosts" | zk_client_config)
     if [ $? -ne 0 -o -z "$zookeeper" ]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
-		   "Expected $NZKINST instances, got '$zookeeper'."\
-		   "Use awld zkstart to start Zookeeper."
+		   "Expected $(ninst zk) instances, got '$zookeeper'."\
+		   "Use awld start-zk to start Zookeeper."
     fi
 
     zkhost=$(echo "$zkhosts" | awk '{print $3 ; exit}')
 
     if [ -z "$zkhost" ]; then
-	>&2 echo "ABORT: invalid zk_instances() output in $FUNCNAME" ; \
+	>&2 echo "ABORT: invalid zk_running() output in $FUNCNAME" ; \
 	    echo "$zkhosts"
 	exit 1
     fi
@@ -1305,7 +1324,7 @@ start() {
    Start logdeviced on one, several, or all nodes in a cluster
    logdeviced instances that are already running are ignored Newly
    started logdeviced processes get their config files from the
-   Zookeeper ensemble previously started with zkstart.
+   Zookeeper ensemble previously started with start-zk.
 
    FLAGS
      -c|--cluster <name> REQUIRED   cluster to operate on
@@ -1322,7 +1341,7 @@ EOF
 
     parse_cluster_filter cluster filter "$@"
     
-    zkhosts=$(zk_instances)
+    zkhosts=$(zk_running)
     if [ $? -ne 0 ]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
@@ -1330,14 +1349,14 @@ EOF
     zookeeper=$(echo "$zkhosts" | zk_client_config)
     if [ $? -ne 0 -o -z "$zookeeper" ]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
-		   "Expected $NZKINST instances, got '$zookeeper'."\
-		   "Use awld zkstart to start Zookeeper."
+		   "Expected $(ninst zk) instances, got '$zookeeper'."\
+		   "Use awld start-zk to start Zookeeper."
     fi
 
     zkhost=$(echo "$zkhosts" | awk '{print $3 ; exit}')
 
     if [ -z "$zkhost" ]; then
-	>&2 echo "ABORT: invalid zk_instances() output in $FUNCNAME" ; \
+	>&2 echo "ABORT: invalid zk_running() output in $FUNCNAME" ; \
 	    echo "$zkhosts"
 	exit 1
     fi
@@ -1481,27 +1500,29 @@ EOF
 }
 
 
-zkcreate() {
+allocate-zk() {
     [[ ${1-} == help ]] && cat <<EOF && return
-  zkcreate       
+  allocate-zk       
 
-  allocate and provision a Zookeeper ensemble if one does not exist for this 
-  AWS user in the AWS region specified in the awld config file. All Zookeeper 
-  hosts are currently allocated from the same AZ. At most $ZK_ENSEMBLE_SIZE
-  instances will be allocated.
+  Create and configure up to $ZK_ENSEMBLE_SIZE Zookeeper instances of type 
+  ${INSTANCE_TYPES[zk]} in the region specified in ~/.awld. The instances are
+  tagged 'logdevice-zk'. If some instances so tagged already exist in the
+  region, only create the number necessary to get the ensemble size 
+  to $ZK_ENSEMBLE_SIZE. The instances will form a Zookeeper ensemble shared
+  among all LogDevice clusters managed by awld.
 EOF
     
-    torun="$(($ZK_ENSEMBLE_SIZE-$NZKINST))"
-    if [ "$torun" -le 0 ]; then
-	echo "$NZKINST Zookeeper instances already exist for this user."\
-	       "Target is $ZK_ENSEMBLE_SIZE instances."
+    torun="$(($ZK_ENSEMBLE_SIZE-$(ninst zk)))"
+    if [[ $torun -le 0 ]]; then
+	echo "$(ninst zk) Zookeeper instances already exist in region"\
+	     "$AWS_REGION. Target is $ZK_ENSEMBLE_SIZE instances."
 	echo "Nothing to do."
 	exit 0
     fi
     
     aws ec2 run-instances --count $torun \
 	--image-id $ZK_AMI \
-	--instance-type $INSTANCE_TYPE_ZK \
+	--instance-type ${INSTANCE_TYPES[zk]} \
 	--key-name $SSH_KEY \
 	--security-group-ids $SECURITY_GROUP \
 	--tag-specifications \
@@ -1510,39 +1531,74 @@ EOF
 }
 
 
-# start all instances in $ZKIIDS. If an instance is already running,
-# it will not be affected. If an instance is stopping, 'zkstart' is
-# cancelled.
-zkstart() {
+allocate-admin() {
+    [[ ${1-} == help ]] && cat <<EOF && return
+  allocate-admin
+
+  Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
+  components (Prometheus, Grafana), and the LogDevice cluster administration 
+  service. The instance is created in the AWS region specified in ~/.awld, 
+  and tagged 'logdevice-admin'. If one already exists, the command does nothing.
+EOF
+
+    local n="$(ninst admin)"
+    case "$n" in
+	0) ;;
+	1) echo "An administrative instance already exists in region"\
+		"$AWS_REGION. Nothing to do."
+	   exit 0
+	   ;;
+	*) 2> echo "ABORT: unexpected value '$n' returned by ninst admin."\
+	    "Expected 0 or 1."
+	   exit 1
+	   ;;
+    esac
+
+    echo "Allocating 1 instance of type ${INSTANCE_TYPES[admin]} for"\
+	 "monitoring and admin services."
+    echo
+    
+    aws ec2 run-instances --count 1 \
+	--image-id $NODE_AMI \
+	--instance-type ${INSTANCE_TYPES[admin]} \
+	--key-name $SSH_KEY \
+	--security-group-ids $SECURITY_GROUP \
+	--tag-specifications \
+ 	  'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]'
+}
+
+
+start-zk() {
     [[ ${1-} == help ]] && cat <<'EOF' && return
-  zkstart        
+  start-zk        
 
   start all AWS instances previously provisioned for Zookeeper by
-  zkcreate. Push a new dynamic ensemble config to all running
-  instances. Launch zookeeper servers on all newly started
-  instances.
+  allocate-zk command. Push a new dynamic ensemble config to all running
+  instances. Launch zookeeper servers on all newly started instances.
+  If an instance is already running, it will not be affected. If an instance is
+  stopping, start-zk is cancelled.
 EOF
 
     echo "Starting Zookeeper ensemble"
     echo
     
-    aws ec2 start-instances --instance-ids $ZKIIDS --output text \
-	2>/tmp/zkstart.err | grep '^CURRENTSTATE' > /tmp/zkstart
-    if [ $(cat /tmp/zkstart | wc -l) != $NZKINST ]; then
+    aws ec2 start-instances --instance-ids ${IIDS[zk]} --output text \
+	2>/tmp/start-zk.err | grep '^CURRENTSTATE' > /tmp/start-zk
+    if [ $(cat /tmp/start-zk | wc -l) != $(ninst zk) ]; then
 	echo "Some instances failed to start"
-	cat /tmp/zkstart.err
+	cat /tmp/start-zk.err
 	exit 1
     fi
-    cat /tmp/zkstart | grep -vE "^CURRENTSTATE[[:blank:]0-9]*(pending|running)"
+    cat /tmp/start-zk | grep -vE "^CURRENTSTATE[[:blank:]0-9]*(pending|running)"
     if [ $? -eq 0 ]; then
 	exit_error "Invalid states detected. Exiting..."
     fi   
 
-    wait_up $ZKIIDS
+    wait_up ${IIDS[zk]}
 
     # At this point all instances should be up, their ips known.
 
-    zkhosts=$(zk_instances)
+    zkhosts=$(zk_running)
     
     # Generate a dynamic config file.
 
@@ -1552,9 +1608,9 @@ EOF
 	exit_error "Failed to get Zookeeper instance attributes. Exiting..."
     fi
     nservers=$(echo "$zkdyncfg" | wc -l)
-    if [ "$nservers" != "$NZKINST" ]; then
+    if [ "$nservers" != "$(ninst zk)" ]; then
 	>&2 echo "ABORT: invalid Zookeeper dynamic config generated."\
-	    "Expected $NZKINST entries, got $nservers."
+	    "Expected $(ninst zk) entries, got $nservers."
 	>&2 cat /tmp/zoo.cfg.dynamic
 	exit 1
     fi
@@ -1592,14 +1648,15 @@ EOF
     echo "$zkhosts" | while read iid ip hostname rest; do
 	echo "Restarting Zookeeper on instance $iid"
 	echo "($hostname)"
+	trap "rm -f /tmp/start-zk-$iid" EXIT
 	</dev/null timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
 	     ssh -T $SSHOPTS ec2-user@$hostname "\
 		/opt/zookeeper/bin/zkServer.sh stop \
 		&& sleep 2 \
 		&& /opt/zookeeper/bin/zkServer.sh start" \
-	     2>&1 | tee /tmp/zkstart-$iid | grep " zookeeper "
+	     2>&1 | tee /tmp/start-zk-$iid | grep " zookeeper "
 	if [ $? -ne 0 ]; then
-	    cat /tmp/zkstart-$iid
+	    cat /tmp/start-zk-$iid
 	    exit_error "Failed to start Zookeeper on instance $iid. Exiting..."
 	fi
     done
@@ -1609,14 +1666,14 @@ EOF
 }
 
 
-zkstop() {
+stop-zk() {
     [[ ${1-} == help ]] && cat <<'EOF' && return
-  zkstop      
+  stop-zk      
 
   stop all AWS instances provisioned for Zookeeper, terminate zookeeper servers
   on them.
 EOF
-    for iid in $ZKIIDS; do    
+    for iid in ${IIDS[zk]}; do    
 	st=$(get_instance_status $iid)
 	if [ $? -ne 0 ]; then
 	    echo "Failed to get instance status for $iid"
@@ -1624,11 +1681,12 @@ EOF
 	fi
 	case "$st" in
 	    ok) echo "Stopping Zookeeper on $iid"
+		trap "rm -f /tmp/stop-zk-$iid" EXIT
 		run_on_instance $iid "/opt/zookeeper/bin/zkServer.sh stop"\
-		                                      >/tmp/zkstop-$iid 2>&1
+		                                      >/tmp/stop-zk-$iid 2>&1
 		if [ $? -ne 0 ]; then
 		    echo "Failed"
-		    cat /tmp/zkstop-$iid
+		    cat /tmp/stop-zk-$iid
 		fi
 		;;
 	    "") echo "No instance status for $iid" ;;
@@ -1638,26 +1696,26 @@ EOF
   
     echo "Stopping all Zookeeper EC2 instances"
     
-    aws ec2 stop-instances --instance-ids $ZKIIDS >/dev/null 2>/tmp/zkstop
+    aws ec2 stop-instances --instance-ids ${IIDS[zk]} >/dev/null 2>/tmp/stop-zk
 
     if [ $? -ne 0 ]; then
 	echo "aws ec2 stop-instances failed"
-	cat /tmp/zkstop
+	cat /tmp/stop-zk
 	exit 1
     fi
 
     # wait until all instances are fully stopped
     
-    for iid in $ZKIIDS; do
+    for iid in ${IIDS[zk]}; do
 	echo "Checking instance $iid"
 	while :; do
 	    state=$(aws ec2 stop-instances --instance-ids $iid --output text \
-			2> /tmp/zkstop-$iid | \
+			2> /tmp/stop-zk-$iid | \
 			awk '/CURRENTSTATE/{print $3}')
 	    case "$state" in
 		stopping) echo -n . ;;
 		stopped)  echo " stopped" ; break ;;
-		"") echo " Failed to stop" ; cat /tmp/zkstop-$iid ; exit 1 ;;
+		"") echo " Failed to stop" ; cat /tmp/stop-zk-$iid ; exit 1 ;;
 		*) echo " " $state ;; # unexpected state, print it
 	    esac
 	    sleep 2
@@ -1666,19 +1724,19 @@ EOF
 }
 
 
-zklist() {
+list-zk() {
     [[ ${1-} == help ]] && cat <<'EOF' && return
-  zklist         
+  list-zk         
 
-  For each Zookeeper instance that has been provisioned with zkcreate,
+  For each Zookeeper instance that has been provisioned by 'allocate-zk',
   and that EC2 believes to be up and running output the following
   fields:
 		        instance-id private-ip public-dns
 
   The command reports status 0 if all instances previously created with 
-  zkcreate are up and running. Otherwise it reports a non-zero status.
+  allocate-zk are up and running. Otherwise it reports a non-zero status.
 EOF
-  zk_instances
+  zk_running
 }
 
 
@@ -1805,13 +1863,13 @@ EOF
  	             "appear to be installed."
     fi	
     
-    fleet_spec_file=$(mktemp /tmp/awld.XXXXXX)
+    local fleet_spec_file=$(mktemp /tmp/awld.XXXXXX)
     trap "rm $fleet_spec_file" EXIT
     
     spot_fleet_request\
 	$cluster $size $storage $sfr_duration $sfr_maxprice "$az"\
 	                                                   >$fleet_spec_file    
-    frq=$(aws ec2 request-spot-fleet \
+    local frq=$(aws ec2 request-spot-fleet \
 	      --spot-fleet-request-config file://$fleet_spec_file)
     if [ $? -ne 0 ]; then
 	exit_error "failed to launch an AWS spot fleet request"
@@ -1991,28 +2049,40 @@ if [ $? -ne 0 ]; then
 	       "ssh-add <path-to-key> to add the key."
 fi
 
-if echo "${COMMANDS[$CMD]}" | sed -n 2p | grep -q needs-ZKIIDS; then
-    # The condition evaluates to true if the second line of COMMANDS[$CMD]
-    # (command attributes) contains the string "needs-ZKIIDS", indicating that
-    # the command requires ZKIIDS and NZKINST to be initialized
-    ZKIIDS=$(aws ec2 describe-instances \
-	     --output text \
-	     --filters 'Name=tag:logdevice-zk,Values=' \
+# process command attributes specified on 2nd line of ${COMMANDS[$CMD]}
+for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
+    case "$a" in
+	find-*) s="$(echo -n $a | cut -c 6-)" ;;
+        *) continue ;;
+    esac
+    if [[ ! ${IIDS[$s]+_} ]]; then
+	2> echo "ABORT: unknown service type $s in "\
+         "find-$s attribute of command specification $CMD"
+	exit 1
+    fi
+
+    # command $CMD requires IIDS[$s] to be set to the list
+    # of EC2 instance ids of allocated instances for the shared service of
+    # type $s.
+
+    IIDS[$s]=$(aws ec2 describe-instances \
+	  --output text \
+	  --filters "Name=tag:logdevice-$s,Values=" \
           'Name=instance-state-name,Values=running,pending,stopping,stopped' \
-	     --query 'Reservations[].Instances[].[InstanceId]' | sort)
+	  --query 'Reservations[].Instances[].[InstanceId]' | sort)
 
     if [ $? -ne 0 ]; then
-	exit_error "failed to get the list of Zookeeper instances from EC2."
+	exit_error "failed to get the list of instances for shared"\
+		   "service '$s' from EC2."
     fi
 
-    # the number of instances in $ZKIIDS
-    NZKINST=$(echo $ZKIIDS | wc -w)
-    
-    if [ "$NZKINST" -eq 0 -a "$CMD" != "zkcreate" ]; then
-	exit_error "no instance ids with tag 'logdevice-zk'. "\
-		   "Use awld zkcreate to provision Zookeeper instances"
+    if [[ $(ninst $s) -eq 0 && "$CMD" != "allocate-$s" ]]; then
+	exit_error "no instance ids with tag 'logdevice-$s' found. "\
+		   "Use 'awld allocate-$s' to provision service"
     fi
-fi
+    unset s
+done
+unset a
 
 tracelog_init
 

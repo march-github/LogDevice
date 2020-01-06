@@ -105,8 +105,7 @@ declare -A COMMANDS=(
                    find-zk"
     [allocate-admin]="create an instance for monitoring and configuration
               find-admin"
-    [list]="list the attributes of all currently allocated LogDevice nodes"
-    [list-zk]="list running Zookeeper instances"
+    [list]="list running AWS instances allocated by awld"
     [terminate]="terminate EC2 instances and spot requests for a cluster"
     [config]="create and store, or retrieve a cluster configuration file
               find-zk"
@@ -211,6 +210,20 @@ readopt() {
     esac    
 }
 
+
+# Check that cluster name in $1 is not empty and follows cluster naming
+# conventions. If any check fails, log an error to stderr and exit.
+validate_cluster_name() {
+    local cluster=$1
+
+    case "$cluster" in
+	"") exit_error "missing cluster name. Use --cluster <name>." ;;
+	!(+([[:word:]]))) exit_error "invalid cluster name '$cluster'."\
+		      "Cluster name must contain only characters a-zA-Z0-9_" ;;
+    esac
+}
+
+
 # output a unique id consisting of 8 hex digits, a hyphen, then another 8 hex
 # This function requires gawk as the version of mawk that comes with
 # Ubuntu 18 does not support systime() and other time functions.
@@ -248,7 +261,7 @@ ninst() {
 
 # For each Zookeeper EC2 instance previously created by allocate-zk and
 # currently in state 'running' output a row in the following format:
-#      private-ip public-dns-name instance-id
+#      instance-id private-ip public-dns-name 
 # sorted alphabetically by instance id, ascending
 # The result may be empty.
 zk_running() {
@@ -655,34 +668,43 @@ list() {
     [[ ${1-} == help ]] && cat <<'EOF' && return
   list 
 
-  list the attributes of all currently allocated LogDevice node
-  instances in the current AWS region. For each instance the following
-  fields are output to stdout:
+  list the attributes of all running instances allocated by awld in the
+  current AWS region. For each instance the following fields are
+  output to stdout:
 
     cluster-name instance-id instance-type location ip hostname roles sfr
 
-  The lines are sorted by (cluster-name,location,instance-id)
-  descending. If the instance was allocated via a spot fleet request,
-  sfr will contain the id of that request. Otherwise sfr is the
-  character '-'.
+  The lines are sorted by (cluster-name,location,instance-id) descending. 
+
+  Instances allocated for shared services: zookeeper, monitoring
+  and administration, and benchmarking, are grouped into pseudo-clusters
+  named [zk], [admin], and [bench] respectively. The 'roles' field is set to
+  '-' for those instances.
+
+  If an instance was allocated via a spot fleet request, its 'sfr'
+  field will contain the id of that request. Otherwise sfr is the
+  character '-'.  
 EOF
     # an aws filter that matches all LogDevice node instances that are
     # either running or coming up. Since we run on local storage, we
     # don't need instances that are stopping or stopped -- those will lose
     # their state. Instances that are shutting down or terminted need not
     # be listed either.
-    running_logdevice_instances='[
+    local running_instances='[
       {
         "Name": "instance-state-name",
         "Values": ["pending","running"]
       },
       {
-        "Name": "tag:logdevice-cluster-name",
-        "Values": ["*"]
+        "Name": "tag-key",
+        "Values": ["logdevice-cluster-name",
+                   "logdevice-zk",
+                   "logdevice-admin",
+                   "logdevice-bench"]
       }
     ]'
 
-    awsquery="Reservations[].Instances[].[
+    local awsquery="Reservations[].Instances[].[
       InstanceId,
       InstanceType,
       Placement.AvailabilityZone,
@@ -690,6 +712,9 @@ EOF
       PublicDnsName,
       Tags[?contains([
          'logdevice-cluster-name',
+         'logdevice-zk',
+         'logdevice-admin',
+         'logdevice-bench',
          'logdevice-rack-id',
          'logdevice-storage',
          'logdevice-sequencer',
@@ -697,26 +722,29 @@ EOF
 
     # an awk script to convert 'describe-instances' output into a table
     # as defined in usage() for the list command.
-    format_results='
+    local format_results='
       function out() {
         if (iid) print cluster" "iid" "itype" "loc" "ip" "hostname" "roles" "sfr
       }
       /^i-/{ out(); 
              iid=$1; itype=$2; ip=$4; hostname=$5; roles=""; sfr="-"; c=""
-             loc=sprintf("%s.%s.0.0",substr($3,1,length($3)-1),
-                                     substr($3,length($3))) }
+             loc=sprintf("%s.%s",substr($3,1,length($3)-1),
+                                 substr($3,length($3))) }
       /^logdevice-storage/{ roles=roles c "storage" ; c="," }
       /^logdevice-sequencer/{ roles=roles c "sequencer" ; c="," }
+      /^logdevice-zk/{ cluster="[zk]" ; roles="-" }
+      /^logdevice-admin/{ cluster="[admin]" ; roles="-" }
+      /^logdevice-bench/{ cluster="[bench]" ; roles="-" }
       /^logdevice-cluster-name/{ cluster=$2 }
-      /^logdevice-rack-id/{ loc=loc"."$2 }
+      /^logdevice-rack-id/{ loc=loc".0.0."$2 }
       /^aws:ec2spot:fleet-request-id/{ sfr=$2 }
       END{ out() }'
 
     aws ec2 describe-instances \
-	--filter "$running_logdevice_instances" \
+	--filter "$running_instances" \
 	--query "$awsquery" \
 	--output text | \
-   awk "$format_results" | sort -k 1,1 -k 4,4 -k 2,2n
+   awk "$format_results" | LC_ALL=C sort -k 1,1 -k 4,4 -k 2,2n
 }
 
 
@@ -970,33 +998,38 @@ EOF
 	esac
     done
 
-    if [[ -z "$cluster" ]]; then
-       exit_error "missing or empty cluster name. Use --cluster <name>."
-    fi
+    validate_cluster_name "$cluster"
 
     if which jq >/dev/null; then
-	prettyprinter="jq ."
+	local prettyprinter="jq ."
     else
-	prettyprinter="cat"
+	local prettyprinter="cat"
     fi
 
-    zkhosts=$(zk_running)
+    local nodes=$(list)
+
+    if [ $? -ne 0 ]; then
+	exit_error "Failed to get the list of nodes for"\
+		   "cluster '$cluster' from AWS"
+    fi
+    
+    local zkinsts=$(echo "$nodes" | awk '/^\[zk\]/{print $2"\t"$5"\t"$6}')
     if [ $? -ne 0 ]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
     
-    zookeeper=$(echo "$zkhosts" | zk_client_config)
+    local zookeeper=$(echo "$zkinsts" | zk_client_config)
     if [ $? -ne 0 -o -z "$zookeeper" ]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
 		   "Use awld start-zk to start Zookeeper."
     fi
 
-    zkhost=$(echo "$zkhosts" | awk '{print $3 ; exit}')
+    local zkhost=$(echo "$zkinsts" | awk '{print $3 ; exit}')
 
     if [ -z "$zkhost" ]; then
-	>&2 echo "ABORT: invalid zk_running() output in $FUNCNAME" ; \
-	    echo "$zkhosts"
+	>&2 echo "ABORT: invalid list() output in $FUNCNAME" ; \
+	    echo "$zkinsts"
 	exit 1
     fi
     
@@ -1006,19 +1039,13 @@ EOF
 	exit
     fi
    
-    nodes=$(list)
-
-    if [ $? -ne 0 ]; then
-	exit_error "Failed to get the list of nodes for cluster '$cluster'."
-    fi
-
-    cluster_nodes=$(echo "$nodes" | grep "^$cluster ")
+    local cluster_nodes=$(echo "$nodes" | grep "^$cluster ")
 
     if [ $? -ne 0 ]; then
 	exit_error "No nodes found for cluster '$cluster' in this AWS region."
     fi
 
-    iids=$(echo "$cluster_nodes" | cut -d ' ' -f 2)
+    local iids=$(echo "$cluster_nodes" | cut -d ' ' -f 2)
 
     echo "Checking that nodes are up and running..."
     
@@ -1341,29 +1368,30 @@ EOF
 
     parse_cluster_filter cluster filter "$@"
     
-    zkhosts=$(zk_running)
+    local zkinsts=$(zk_running)
     if [ $? -ne 0 ]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
     
-    zookeeper=$(echo "$zkhosts" | zk_client_config)
+    local zookeeper=$(echo "$zkinsts" | zk_client_config)
     if [ $? -ne 0 -o -z "$zookeeper" ]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
 		   "Use awld start-zk to start Zookeeper."
     fi
 
-    zkhost=$(echo "$zkhosts" | awk '{print $3 ; exit}')
+    local zkhost=$(echo "$zkinsts" | awk '{print $3 ; exit}')
 
     if [ -z "$zkhost" ]; then
 	>&2 echo "ABORT: invalid zk_running() output in $FUNCNAME" ; \
-	    echo "$zkhosts"
+	    echo "$zkinsts"
 	exit 1
     fi
 
     # expecting to get an empty string if config znode exists, or
     # a "Node does not exist:" error.
-    zkerr=$(echo "ls /conf/${cluster}.conf" | zkcli $zkhost 2>&1 1>/dev/null)
+    local zkerr=$(echo "ls /conf/${cluster}.conf" | \
+		      zkcli $zkhost 2>&1 1>/dev/null)
     case "$?" in
 	0) ;;
 	1) if echo $zkerr | grep -q "Node does not exist:"; then
@@ -1538,7 +1566,8 @@ allocate-admin() {
   Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
   components (Prometheus, Grafana), and the LogDevice cluster administration 
   service. The instance is created in the AWS region specified in ~/.awld, 
-  and tagged 'logdevice-admin'. If one already exists, the command does nothing.
+  and tagged 'logdevice-admin'. If such an instance already exists, 
+  the command does nothing.
 EOF
 
     local n="$(ninst admin)"
@@ -1598,16 +1627,16 @@ EOF
 
     # At this point all instances should be up, their ips known.
 
-    zkhosts=$(zk_running)
+    local zkinsts=$(zk_running)
     
     # Generate a dynamic config file.
 
-    zkdyncfg=$(echo "$zkhosts" | awk -v cport=$ZKCLTPORT \
-		  '{printf "server.%s=%s:2182:2183;"cport"\n", NR, $2}')
+    local zkdyncfg=$(echo "$zkinsts" | awk -v cport=$ZKCLTPORT \
+		      '{printf "server.%s=%s:2182:2183;"cport"\n", NR, $2}')
     if [ $? -ne 0 ]; then
 	exit_error "Failed to get Zookeeper instance attributes. Exiting..."
     fi
-    nservers=$(echo "$zkdyncfg" | wc -l)
+    local nservers=$(echo "$zkdyncfg" | wc -l)
     if [ "$nservers" != "$(ninst zk)" ]; then
 	>&2 echo "ABORT: invalid Zookeeper dynamic config generated."\
 	    "Expected $(ninst zk) entries, got $nservers."
@@ -1620,7 +1649,7 @@ EOF
     echo
     
     # copy dynamic Zookeeper configs to instances
-    echo "$zkhosts" | while read iid ip hostname rest; do
+    echo "$zkinsts" | while read iid ip hostname rest; do
 	myid=$(echo "$zkdyncfg" | awk -F '[.=]' "/=$ip:/{print \$2}")
 	if [ -z "$myid" ]; then
 	    >&2 echo "ABORT: could not extract Zookeeper host id for $ip from"\
@@ -1645,7 +1674,7 @@ EOF
    
     # all dynamic files have been copied. (Re)start Zookeeper
 
-    echo "$zkhosts" | while read iid ip hostname rest; do
+    echo "$zkinsts" | while read iid ip hostname rest; do
 	echo "Restarting Zookeeper on instance $iid"
 	echo "($hostname)"
 	trap "rm -f /tmp/start-zk-$iid" EXIT
@@ -1673,8 +1702,9 @@ stop-zk() {
   stop all AWS instances provisioned for Zookeeper, terminate zookeeper servers
   on them.
 EOF
+ 
     for iid in ${IIDS[zk]}; do    
-	st=$(get_instance_status $iid)
+	local st=$(get_instance_status $iid)
 	if [ $? -ne 0 ]; then
 	    echo "Failed to get instance status for $iid"
 	    exit 1
@@ -1724,22 +1754,6 @@ EOF
 }
 
 
-list-zk() {
-    [[ ${1-} == help ]] && cat <<'EOF' && return
-  list-zk         
-
-  For each Zookeeper instance that has been provisioned by 'allocate-zk',
-  and that EC2 believes to be up and running output the following
-  fields:
-		        instance-id private-ip public-dns
-
-  The command reports status 0 if all instances previously created with 
-  allocate-zk are up and running. Otherwise it reports a non-zero status.
-EOF
-  zk_running
-}
-
-
 allocate() {
     [[ ${1-} == help ]] && cat <<EOF && return
   allocate
@@ -1761,7 +1775,6 @@ allocate() {
   FLAGS
     -c|--cluster <name>          REQUIRED
                    LogDevice cluster to which this allocation belongs.
-                   Spaces are not allowed in name.
                    All allocated instances will be tagged with
                    logdevice-cluster-name=<name> 
 
@@ -1815,11 +1828,7 @@ EOF
 	esac
     done
 
-    case "$cluster" in
-	"") exit_error "missing cluster name. Use --cluster <name>." ;;
-	!(+([[:word:]]))) exit_error "invalid cluster name '$cluster'."\
-		      "Cluster name must contain only [a-zA-Z0-9_]" ;;
-    esac
+    validate_cluster_name "$cluster"
 
     case "$size" in
         !(+([[:digit:]]))) exit_error "invalid number of instances '$size'."\
@@ -2052,7 +2061,7 @@ fi
 # process command attributes specified on 2nd line of ${COMMANDS[$CMD]}
 for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
     case "$a" in
-	find-*) s="$(echo -n $a | cut -c 6-)" ;;
+	find-*) s=${a:5} ;;
         *) continue ;;
     esac
     if [[ ! ${IIDS[$s]+_} ]]; then

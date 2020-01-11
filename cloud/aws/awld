@@ -29,14 +29,16 @@
 set -uo pipefail
 shopt -s extglob
 
-NRETRIES=40 # maximum number of retries when checking for
-            # the completion of instance initialization
-PAUSE=10    # pause between status polls in seconds
-SSHOPTS="-oStrictHostKeyChecking=no" # options to pass to ssh,scp
-CFGPATH=~/.awld        # user-defined config settings are read from here
-TRACELOG=/tmp/awld.log # output useful for debugging awld goes here (rotated)
 
-STORAGE_TYPES="ssd|hdd|none" # supported storage types
+declare -r NRETRIES=40 # maximum number of retries when checking for
+                       # the completion of instance initialization
+declare -r PAUSE=10    # pause between status polls in seconds
+declare -r SSHOPTS="-oStrictHostKeyChecking=no" # options to pass to ssh,scp
+declare -r CFGPATH=~/.awld # user-defined config settings are read from here
+declare -r TRACELOG=/tmp/awld.log # output useful for debugging awld goes
+                                  # here (rotated)
+
+declare -r STORAGE_TYPES="ssd|hdd|none" # supported storage types
 
 declare -Ar INSTANCE_TYPES=(
     [ssd]="m5ad.4xlarge r5dn.4xlarge r5d.4xlarge\
@@ -46,48 +48,57 @@ declare -Ar INSTANCE_TYPES=(
     [admin]="t2.medium"
 )
 
-DEFAULT_SFR_MAXPRICE="0.50"  # default maximum spot instance price per hour
-DEFAULT_SFR_DURATION="1day" # default duration of spot requests for nodes
+declare -r DEFAULT_SFR_MAXPRICE="0.50"  # default max spot instance price/hr
+declare -r DEFAULT_SFR_DURATION="1day" # default duration of spot requests
 
-ZKCLTPORT=2181  # Zookeeper client port
-ZKDATADIR=/var/zookeeper  # data directory on Zookeeper hosts
-ZOOCFG="/opt/zookeeper/conf/zoo.cfg" # path to ZK config file on ZK instance
-ZK_ENSEMBLE_SIZE=3 # target number of instances in LD Zookeeper ensemble
-ZK_CLIENT_TIMEOUT="30s" # ZK client timeout value to put in cluster config
+declare -r ZKCLTPORT=2181  # Zookeeper client port
+declare -r ZKDATADIR=/var/zookeeper  # data directory on Zookeeper hosts
+declare -r \
+  ZOOCFG="/opt/zookeeper/conf/zoo.cfg" # path to ZK config file on ZK instance
+declare -r \
+  ZK_ENSEMBLE_SIZE=3 # target number of instances in LD Zookeeper ensemble
+declare -r \
+  ZK_CLIENT_TIMEOUT="30s" # ZK client timeout value to put in cluster config
 
-# This map describes the provisioned instances of shared services, grouped by
+# Name of EC2 instance profile to use when creating node and admin instances.
+# The profile is expected to contain role "AWLD" containing
+# AmazonEC2ReadOnlyAccess policy.
+declare -r NODE_INSTANCE_PROFILE="AWLD"
+
+# This map describes provisioned instances of shared services, grouped by
 # service type. [zk] for Zookeeper, [admin] for the monitoring and
 # administration instance, [bench] for the load generator.  The values
 # are space-separated lists of EC2 instance ids.
 declare -A IIDS=([zk]= [admin]= [bench]=)
 
 # LogDevice server ports
-PORT_CLIENT=16001
-PORT_GOSSIP=16002
-PORT_SSL=
-PORT_ADMIN=16004
+declare -r \
+PORT_CLIENT=16001 \
+PORT_GOSSIP=16002 \
+PORT_SSL= \
+PORT_ADMIN=16004 \
 PORT_COMMAND=16005
 
-NODES_MAX=512   # maximum number of nodes in a LogDevice cluster
-DATADIR="/data" # directory where NSHARDS and shard mount points are
-                # located on storage nodes. 
+declare -r NODES_MAX=512   # maximum number of nodes in a LogDevice cluster
+declare -r DATADIR="/data" # directory where NSHARDS and shard mount points are
+                           # located on storage nodes. 
 
-INTERNAL_LOGS_COPYSET_SIZE=3  # up to the size of the cluster
-METADATA_LOGS_COPYSET_SIZE=5  # ditto
-INTERNAL_LOGS_NODESET_SIZE=11 # this applies both to internal logs and
-                              # metadata logs
+declare -r INTERNAL_LOGS_COPYSET_SIZE=3  # up to the size of the cluster
+declare -r METADATA_LOGS_COPYSET_SIZE=5  # ditto
+declare -r INTERNAL_LOGS_NODESET_SIZE=11 # this applies both to internal logs
+                                         # and metadata logs
 
 # path to local logdeviced control script on nodes
-LOGDEVICEDCTL="/usr/local/bin/logdevicedctl"
+declare -r LOGDEVICEDCTL="/usr/local/bin/logdevicedctl"
 
 # path to file on LD nodes containing the location of logdevice config
 # in the zk://<ip:port...>/<path> format
-LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
+declare -r LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
 
-SSH_TIMEOUT="2m" # timeout(1) for remote commands over ssh
-SSH_KILL_AFTER="3m"  # SIGKILL ssh after this much time
+declare -r SSH_TIMEOUT="2m" # timeout(1) for remote commands over ssh
+declare -r SSH_KILL_AFTER="3m"  # SIGKILL ssh after this much time
 
-export AWS_DEFAULT_OUTPUT=text
+declare -rx AWS_DEFAULT_OUTPUT=text
 
 # An associative array defining top-level commands.
 #
@@ -95,34 +106,36 @@ export AWS_DEFAULT_OUTPUT=text
 # may be specified, separated by newlines. The first line contains a short
 # description of the command that 'help' prints. The only other supported
 # attribute currently is the space-separated set of infrastructure components
-# required by the command. The format is "find-zk find-admin find-bench",
+# required by the command. The format is any combination of:
+#    require-zk require-admin require-bench
 # which indicates that IIDS[zk], IIDS[admin], or IIDS[bench] respectively must
 # be initialized (and errors handled) before running the command.
 #
 declare -A COMMANDS=(
     [allocate]="create new LogDevice nodes by requesting instances from EC2"
     [allocate-zk]="create up to $ZK_ENSEMBLE_SIZE instances for the shared Zookeeper ensemble
-                   find-zk"
+                   require-zk"
     [allocate-admin]="create an instance for monitoring and configuration
-              find-admin"
-    [list]="list running AWS instances allocated by awld"
-    [terminate]="terminate EC2 instances and spot requests for a cluster"
+              require-admin"
+    [list]="list running EC2 instances allocated by awld"
+    [terminate]="terminate EC2 instances and spot requests for a LogDevice cluster"
+    [terminate-admin]="terminate EC2 instance running monitoring and config services
+                       require-admin"
     [config]="create and store, or retrieve a cluster configuration file
-              find-zk"
+              require-zk"
     [start]="start logdeviced on one, several, or all nodes in a cluster
-              find-zk"
+              require-zk"
     [start-zk]="start all Zookeeper instances previously created by allocate-zk
-              find-zk"    
+              require-zk"    
     [stop]="stop logdeviced on one, several, or all nodes in a cluster"
-    [stop-zk]="stop all Zookeeper instances, terminate zookeeper daemons
-              find-zk"
+    [stop-zk]="shut down Zookeeper service and stop all Zookeeper instances, 
+              require-zk"
     [status]="check whether logdeviced is running"
     [help]="print help"
 )
 
-
 # an extended glob matching names of all supported commands
-CMDGLOB="@($(echo "${!COMMANDS[@]}" | tr ' ' '|'))"
+declare -r CMDGLOB="@($(echo "${!COMMANDS[@]}" | tr ' ' '|'))"
 
 
 usage () {
@@ -137,6 +150,7 @@ awld help all         for help on all commands
 
 EOF
 }
+
 
 help() {
     [[ ${1-} == help ]] && cat <<EOF && return
@@ -200,7 +214,7 @@ tracelog() {
 readopt() {
     local -n option_var_ref=$1
 
-    if [ $# -lt 3 ]; then
+    if [[ $# -lt 3 ]]; then
 	exit_error "Option $2 requires a value."
     fi
     
@@ -247,7 +261,7 @@ next_to_last_line() {
 }
 
 
-# Returns the number of instances of shared service of type $1,
+# Returns the number of allocated instances of shared service of type $1,
 # which must be one of the keys of ${IIDS[]} map.
 ninst() {
     if [[ ${IIDS[$1]+_} ]]; then    #key exists
@@ -327,7 +341,7 @@ wait_up() {
 	echo "Checking instance $iid"
 	for attempt in $(seq 1 $NRETRIES); do
 	      st=$(get_instance_status $iid)
-	      if [ $? -ne 0 ]; then
+	      if [[ $? -ne 0 ]]; then
 		  exit_error "Failed to get instance status for $iid"
 	      fi
 	      case "$st" in
@@ -338,7 +352,7 @@ wait_up() {
 	      esac
 	      sleep $PAUSE
 	done
-	if [ $attempt -eq $NRETRIES ]; then
+	if [[ $attempt -eq $NRETRIES ]]; then
 	    exit_error "Maximum number of retries reached. Exiting..."
 	fi
     done
@@ -362,7 +376,7 @@ deadline=$(($(date +%s)+$timeout))
 
 case "${1-}" in
    start) 
-     if [ ! -r $LOGDEVICECONFIG_LOC ]; then
+     if [[ ! -r $LOGDEVICECONFIG_LOC ]]; then
        >&2 echo "ERROR: $LOGDEVICECONFIG_LOC not found or not readable"
        exit 1
      fi
@@ -462,12 +476,12 @@ shard_init_script() {
     envsubst "$substitute" <<"EOF"
 DEVICES=$(lsblk | awk '/^nvme/{print $1}' | sort -n)
 
-if [ $? -ne 0 ]; then
+if [[ $? -ne 0 ]]; then
     echo "Failed to list block devices"
     exit 1
 fi
 
-if [ -z "$DEVICES" ]; then
+if [[ -z "$DEVICES" ]]; then
     echo "No suitable block devices found"
     exit 1
 fi
@@ -475,21 +489,21 @@ fi
 n=0
 for d in $DEVICES; do
     mkfs -t xfs /dev/$d 2>/tmp/mkfs.err
-    if [ $? -eq 0 ]; then
+    if [[ $? -eq 0 ]]; then
         mp="$DATADIR/shard${n}"
 	mkdir -p $mp && mount -o discard /dev/$d $mp &&	chown logdevice $mp
-	if [ $? -ne 0 ]; then
+	if [[ $? -ne 0 ]]; then
 	    echo "Failed to mount /dev/$d on $mp. Exiting."
 	    exit 1
 	fi
 	echo "/dev/$d $mp xfs defaults,discard 0 0" >> /etc/fstab
-        if [ $n -eq 0 ]; then
+        if [[ $n -eq 0 ]]; then
             crashdir=$mp/crash
             mkdir $crashdir && chmod a+wt $crashdir && \
             rm -rf /var/crash && ln -s $crashdir /var/crash && \
             echo "$crashdir/%E-%t-%p-%i" > /proc/sys/kernel/core_pattern && \
             echo "root hard core unlimited" >> /etc/security/limits.conf
-            if [ $? -ne 0 ]; then
+            if [[ $? -ne 0 ]]; then
               echo "Failed to set up core files directory $crashdir"
             fi
         fi
@@ -507,7 +521,7 @@ for d in $DEVICES; do
     ((n+=1))
 done
 
-if [ $n -gt 0 ]; then
+if [[ $n -gt 0 ]]; then
     echo $n > $DATADIR/NSHARDS
 fi
 EOF
@@ -566,7 +580,7 @@ spot_fleet_request() {
     local sfr_maxprice=$5
     local az=$6
 
-    if [ -z $cluster ]; then
+    if [[ -z $cluster ]]; then
        >&2 echo "ABORT: empty cluster name in $FUNCNAME"
        exit 1
     fi
@@ -576,7 +590,7 @@ spot_fleet_request() {
     fi
 
     local tags='{"Key": "logdevice-sequencer", "Value": ""}'
-    if [ "$storage" != "none" ]; then
+    if [[ "$storage" != "none" ]]; then
 	tags="$tags, {\"Key\": \"logdevice-storage\", \"Value\": \"\"}"
     fi
     
@@ -590,7 +604,7 @@ spot_fleet_request() {
 
     local account=$(aws sts get-caller-identity \
 			--query Account --output text)
-    if [ $? -ne 0 -o -z "$account" ]; then
+    if [[ $? -ne 0 || -z "$account" ]]; then
 	exit_error "Failed to get AWS account id for this user."\
 		   "Run aws configure."
     fi
@@ -776,12 +790,12 @@ nodes_and_internal_config() {
     echo '  "nodes": ['
     
     while read -r cn iid itype loc ip hostname roles rest; do
-	if [ "$cn" != "$cluster" ]; then
+	if [[ "$cn" != "$cluster" ]]; then
 	    >&2 echo "ABORT: invalid cluter name in $FUNCNAME."\
 		"Expected '$cluster'. Got '$cn'."
 	    exit 1
 	fi
-	if [ $nid -ge $NODES_MAX ]; then
+	if [[ $nid -ge $NODES_MAX ]]; then
 	    error_exit "Cluster $cluster has too many nodes. "\
 		       "Limit is $NODES_MAX."
 	fi
@@ -828,18 +842,18 @@ EOF
     node_count=$nid
     rack_count=${#ids_by_rack[@]}
 
-    if [ $node_count -lt 1 ]; then
+    if [[ $node_count -lt 1 ]]; then
 	>&2 echo "ABORT: invalid node count $node_count in $FUNCNAME"
 	exit 1
     fi
-    if [ $rack_count -lt 1 ]; then
+    if [[ $rack_count -lt 1 ]]; then
 	>&2 echo "ABORT: invalid rack count $rack_count in $FUNCNAME"
 	exit 1
     fi
     
     # cross-rack replication is not supported yet
 
-    if [ $node_count -lt $INTERNAL_LOGS_NODESET_SIZE ]; then
+    if [[ $node_count -lt $INTERNAL_LOGS_NODESET_SIZE ]]; then
 	internal_nodeset_size=$node_count
 	>&2 echo "WARNING: INTERNAL_LOGS_NODESET_SIZE"\
 	    "($INTERNAL_LOGS_NODESET_SIZE) exceeds cluster size"\
@@ -850,8 +864,8 @@ EOF
 	internal_nodeset_size=$INTERNAL_LOGS_NODESET_SIZE
     fi    
 
-    if [ $node_count -le $INTERNAL_LOGS_COPYSET_SIZE ]; then
-	if [ $node_count -le 1 ]; then
+    if [[ $node_count -le $INTERNAL_LOGS_COPYSET_SIZE ]]; then
+	if [[ $node_count -le 1 ]]; then
 	    internal_copyset_size=1
 	else
 	    internal_copyset_size=$(($node_count-1))
@@ -866,8 +880,8 @@ EOF
 	internal_copyset_size=$INTERNAL_LOGS_COPYSET_SIZE
     fi    
 	
-    if [ $node_count -le $METADATA_LOGS_COPYSET_SIZE ]; then
-	if [ $node_count -le 1 ]; then
+    if [[ $node_count -le $METADATA_LOGS_COPYSET_SIZE ]]; then
+	if [[ $node_count -le 1 ]]; then
 	    metadata_copyset_size=1
 	else
 	    metadata_copyset_size=$(($node_count-1))
@@ -987,7 +1001,7 @@ EOF
     local force=
     local dry=
     
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -c|--cluster) readopt cluster $@ ; shift ; shift ;;
 	    --dryrun) dry=1 ; shift ;;
@@ -1008,18 +1022,18 @@ EOF
 
     local nodes=$(list)
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of nodes for"\
 		   "cluster '$cluster' from AWS"
     fi
     
     local zkinsts=$(echo "$nodes" | awk '/^\[zk\]/{print $2"\t"$5"\t"$6}')
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
     
     local zookeeper=$(echo "$zkinsts" | zk_client_config)
-    if [ $? -ne 0 -o -z "$zookeeper" ]; then
+    if [[ $? -ne 0 || -z "$zookeeper" ]]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
 		   "Use awld start-zk to start Zookeeper."
@@ -1027,13 +1041,13 @@ EOF
 
     local zkhost=$(echo "$zkinsts" | awk '{print $3 ; exit}')
 
-    if [ -z "$zkhost" ]; then
+    if [[ -z "$zkhost" ]]; then
 	>&2 echo "ABORT: invalid list() output in $FUNCNAME" ; \
 	    echo "$zkinsts"
 	exit 1
     fi
     
-    if [ -n "$show" ]; then
+    if [[ -n "$show" ]]; then
 	echo "get /conf/${cluster}.conf" | zkcli $zkhost |\
 	    grep ",\"cluster\":\"$cluster\"," | $prettyprinter
 	exit
@@ -1041,7 +1055,7 @@ EOF
    
     local cluster_nodes=$(echo "$nodes" | grep "^$cluster ")
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "No nodes found for cluster '$cluster' in this AWS region."
     fi
 
@@ -1051,15 +1065,15 @@ EOF
     
     wait_up $iids
 
-    if [ -n "$dry" ]; then
+    if [[ -n "$dry" ]]; then
 	echo "$cluster_nodes" | cluster_config $cluster $zookeeper |\
 	    $prettyprinter
 	exit
     fi
     
-    if [ -z "$force" ]; then
+    if [[ -z "$force" ]]; then
 	echo ls /conf/${cluster}.conf | zkcli $zkhost |& tracelog
-	if [ $? -eq 0 ]; then
+	if [[ $? -eq 0 ]]; then
 	    exit_error "Found an existing config file for cluster '$cluster'"\
 		       "in Zookeeper. --show to view, --force to overwrite."
 	fi
@@ -1072,13 +1086,28 @@ EOF
 	 tr -d '[:space:]' ;\
      echo) | zkcli $zkhost |& tracelog
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to store config for cluster '$cluster' in "\
 		   "Zookeeper. Check $TRACELOG for details."
     fi
 
     echo "Successfully created a LogDevice config file for cluster '$cluster'"
     echo "and stored it in Zookeeper under /conf/$cluster.conf"
+}
+
+
+terminate-admin() {
+    [[ ${1-} == help ]] && cat <<'EOF' && return    
+   terminate-admin
+
+   Terminate EC2 instance previously allocated by allocate-admin for
+   running monitoring components (Prometheus, Grafana), and the LogDevice 
+   cluster administration service. The monitoring dataset collected 
+   by Prometheus will be lost. The command will search for the admin
+   instance in the AWS region specified in ~/.awld.
+EOF
+
+    aws ec2 terminate-instances --instance-ids ${IIDS[admin]}
 }
 
 
@@ -1102,7 +1131,7 @@ EOF
     local rack=
     local dryrun=
 
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -c|--cluster) readopt cluster $@ ; shift ; shift ;;
 	    -r|--rack)    readopt rack $@    ; shift ; shift ;;
@@ -1112,41 +1141,41 @@ EOF
 	esac
     done
 
-    if [ -z $cluster ]; then
+    if [[ -z $cluster ]]; then
        exit_error "missing or empty cluster name. Use --cluster <name>."
     fi
 
-    nodes=$(list)
+    local nodes=$(list)
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to list LogDevice EC2 instances"
     fi
 
     # $matching is a list of newline-separated records with the following
     # fields: iid rack-id [sfr]
-    matching=$(echo "$nodes" | awk -v cluster="$cluster" -v rack="$rack" \
+    local matching=$(echo "$nodes" | awk -v cluster="$cluster" -v rack="$rack" \
 	  '{ if ($1==cluster) {
                if (split($4, loc, "[.]") != 5) exit 1;
                if (!rack || loc[5]==rack) print $2" "loc[5]" "$8;
              }}')
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	echo "$nodes"
         exit_error "Invalid record format in the output of 'list' command."\
 		   "Expected 4th field (location) to have 5 dot-separated "\
 		   "components."
     fi
 
-    if [ -z "$matching" ]; then
+    if [[ -z "$matching" ]]; then
 	echo "No matching instances"
 	return
     fi
 
     # get spot fleet requests, if any, for the racks being terminated
     
-    sfrs=$(echo "$matching" | cut -d ' ' -f 3 | sort | uniq)
+    local sfrs=$(echo "$matching" | cut -d ' ' -f 3 | sort | uniq)
 
-    if [ -n "$rack" -a $(echo "$sfrs" | wc -l) -gt 1 ]; then
+    if [[ -n "$rack" && $(echo "$sfrs" | wc -l) -gt 1 ]]; then
 	echo "ERROR: a single rack $rack was specified, but it matched"\
 	     "multiple spot fleet requests:"
 	echo "$sfrs"
@@ -1164,7 +1193,7 @@ EOF
 	*) echo "Not confirmed" ; exit 0 ;;
     esac
    
-    if [ -n "$sfrs" ]; then
+    if [[ -n "$sfrs" ]]; then
 	echo "Cancelling spot fleet request(s)"
 	echo "$sfrs"
 	aws ec2 cancel-spot-fleet-requests \
@@ -1172,19 +1201,19 @@ EOF
 	    --terminate-instances $dryrun	    
     fi
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	echo "Warning: failed to cancel spot fleet request(s)"\
 	     "Check EC2 console."	
     fi    
 
-    iids=$(echo "$matching" | cut -d ' ' -f 1)
+    local iids=$(echo "$matching" | cut -d ' ' -f 1)
     
     echo "Terminating instance(s)"
     echo "$iids"
     
     aws ec2 terminate-instances --instance-ids $iids $dryrun
     
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to terminate EC2 instances."\
 		   "Run awld list for status."	
     fi
@@ -1325,7 +1354,7 @@ parse_cluster_filter() {
 
     shift ; shift
     
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -c|--cluster) cluster_ref=${2-} ; shift ; shift ;;
 	    -*|--*=) exit_error "unknown flag $1" ;;
@@ -1369,12 +1398,12 @@ EOF
     parse_cluster_filter cluster filter "$@"
     
     local zkinsts=$(zk_running)
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
     
     local zookeeper=$(echo "$zkinsts" | zk_client_config)
-    if [ $? -ne 0 -o -z "$zookeeper" ]; then
+    if [[ $? -ne 0 || -z "$zookeeper" ]]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
 		   "Use awld start-zk to start Zookeeper."
@@ -1382,7 +1411,7 @@ EOF
 
     local zkhost=$(echo "$zkinsts" | awk '{print $3 ; exit}')
 
-    if [ -z "$zkhost" ]; then
+    if [[ -z "$zkhost" ]]; then
 	>&2 echo "ABORT: invalid zk_running() output in $FUNCNAME" ; \
 	    echo "$zkinsts"
 	exit 1
@@ -1464,7 +1493,7 @@ EOF
     local long=0
     local args=
     
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -l|--long) ((long++)) ;;
 	    *) args="$args $1" ;;
@@ -1566,8 +1595,8 @@ allocate-admin() {
   Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
   components (Prometheus, Grafana), and the LogDevice cluster administration 
   service. The instance is created in the AWS region specified in ~/.awld, 
-  and tagged 'logdevice-admin'. If such an instance already exists, 
-  the command does nothing.
+  and is tagged 'logdevice-admin'. If an instance with that tag already exists
+  in that region, the command does nothing.
 EOF
 
     local n="$(ninst admin)"
@@ -1586,14 +1615,34 @@ EOF
     echo "Allocating 1 instance of type ${INSTANCE_TYPES[admin]} for"\
 	 "monitoring and admin services."
     echo
+
+    local errfile="/tmp/awld-run-instances-$$.err"
+    trap "rm -f $errfile" EXIT
     
     aws ec2 run-instances --count 1 \
 	--image-id $NODE_AMI \
 	--instance-type ${INSTANCE_TYPES[admin]} \
 	--key-name $SSH_KEY \
 	--security-group-ids $SECURITY_GROUP \
+	--iam-instance-profile Name=$NODE_INSTANCE_PROFILE \
 	--tag-specifications \
- 	  'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]'
+ 	'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]' \
+	2>$errfile
+
+    if [[ $? -ne 0 ]]; then
+	local status=$?
+	if grep -q "Value ($NODE_INSTANCE_PROFILE) for parameter iamInstanceProfile.name is invalid" $errfile; then
+	cat <<EOF
+  ERROR: failed to run an EC2 instance because instance profile $NODE_INSTANCE_PROFILE
+  was not found. Use AWS console to create IAM role '$NODE_INSTANCE_PROFILE'. 
+  The role must contain AmazonEC2ReadOnlyAccess policy. The EC2 user that 
+  awld runs as must have PassRole permissions for role '$NODE_INSTANCE_PROFILE'.
+EOF
+	else
+	    cat $errfile
+	fi
+	exit $status
+    fi
 }
 
 
@@ -1613,13 +1662,13 @@ EOF
     
     aws ec2 start-instances --instance-ids ${IIDS[zk]} --output text \
 	2>/tmp/start-zk.err | grep '^CURRENTSTATE' > /tmp/start-zk
-    if [ $(cat /tmp/start-zk | wc -l) != $(ninst zk) ]; then
+    if [[ $(cat /tmp/start-zk | wc -l) != $(ninst zk) ]]; then
 	echo "Some instances failed to start"
 	cat /tmp/start-zk.err
 	exit 1
     fi
     cat /tmp/start-zk | grep -vE "^CURRENTSTATE[[:blank:]0-9]*(pending|running)"
-    if [ $? -eq 0 ]; then
+    if [[ $? -eq 0 ]]; then
 	exit_error "Invalid states detected. Exiting..."
     fi   
 
@@ -1633,11 +1682,11 @@ EOF
 
     local zkdyncfg=$(echo "$zkinsts" | awk -v cport=$ZKCLTPORT \
 		      '{printf "server.%s=%s:2182:2183;"cport"\n", NR, $2}')
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get Zookeeper instance attributes. Exiting..."
     fi
     local nservers=$(echo "$zkdyncfg" | wc -l)
-    if [ "$nservers" != "$(ninst zk)" ]; then
+    if [[ "$nservers" != "$(ninst zk)" ]]; then
 	>&2 echo "ABORT: invalid Zookeeper dynamic config generated."\
 	    "Expected $(ninst zk) entries, got $nservers."
 	>&2 cat /tmp/zoo.cfg.dynamic
@@ -1651,7 +1700,7 @@ EOF
     # copy dynamic Zookeeper configs to instances
     echo "$zkinsts" | while read iid ip hostname rest; do
 	myid=$(echo "$zkdyncfg" | awk -F '[.=]' "/=$ip:/{print \$2}")
-	if [ -z "$myid" ]; then
+	if [[ -z "$myid" ]]; then
 	    >&2 echo "ABORT: could not extract Zookeeper host id for $ip from"\
 	        "dynamic config in $FUNCNAME"
 	    exit 1
@@ -1666,7 +1715,7 @@ EOF
 	echo "$zkdyncfg" | timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
 				   ssh -T $SSHOPTS ec2-user@$hostname bash -c \
 	  "cat > ${ZOOCFG}.dynamic && echo $myid > $ZKDATADIR/myid"
-	if [ $? -ne 0 ]; then
+	if [[ $? -ne 0 ]]; then
 	    exit_error "Failed to copy dynamic Zookeeper configuration to "\
 		 "$hostname. Exiting..."
 	fi	
@@ -1684,7 +1733,7 @@ EOF
 		&& sleep 2 \
 		&& /opt/zookeeper/bin/zkServer.sh start" \
 	     2>&1 | tee /tmp/start-zk-$iid | grep " zookeeper "
-	if [ $? -ne 0 ]; then
+	if [[ $? -ne 0 ]]; then
 	    cat /tmp/start-zk-$iid
 	    exit_error "Failed to start Zookeeper on instance $iid. Exiting..."
 	fi
@@ -1705,7 +1754,7 @@ EOF
  
     for iid in ${IIDS[zk]}; do    
 	local st=$(get_instance_status $iid)
-	if [ $? -ne 0 ]; then
+	if [[ $? -ne 0 ]]; then
 	    echo "Failed to get instance status for $iid"
 	    exit 1
 	fi
@@ -1714,7 +1763,7 @@ EOF
 		trap "rm -f /tmp/stop-zk-$iid" EXIT
 		run_on_instance $iid "/opt/zookeeper/bin/zkServer.sh stop"\
 		                                      >/tmp/stop-zk-$iid 2>&1
-		if [ $? -ne 0 ]; then
+		if [[ $? -ne 0 ]]; then
 		    echo "Failed"
 		    cat /tmp/stop-zk-$iid
 		fi
@@ -1728,7 +1777,7 @@ EOF
     
     aws ec2 stop-instances --instance-ids ${IIDS[zk]} >/dev/null 2>/tmp/stop-zk
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	echo "aws ec2 stop-instances failed"
 	cat /tmp/stop-zk
 	exit 1
@@ -1769,7 +1818,7 @@ allocate() {
   allocated by this command will reside in a single AZ in the
   default AWS region configured in $CFGPATH config file.
 
-  AWS user that awld runs as must have AmazonEC2SpotFleetTaggingRole
+  AWS user that awld runs as must have AmazonEC2SpotFleetTaggingRole.
   https://docs.aws.amazon.com/batch/latest/userguide/spot_fleet_IAM_role.html
 
   FLAGS
@@ -1799,14 +1848,15 @@ allocate() {
                    AZ in which to allocate instances.
                    <availability-zone> must be a single letter identifying
                    a valid availability zone in the AWS region used by awld. 
-                   For example, if the value of AWS_REGION  setting in $CFGPATH
-                   config file is us-east-1 and <availability-zone> is f, 
-                   then instances will be allocated in the us-east-1f AZ.
-                   Use this option when growing a cluster if you woud like to 
-                   avoid cross-AZ traffic charges. If not specified, the spot 
-                   fleet request will pick the AZ using the AWS 
-                   capacityOptimized strategy, which minimizes the chance of 
-                   interruption.
+                   For example, if the value of AWS_REGION  setting in 
+                   $CFGPATH config file is us-east-1 
+                   and <availability-zone> is f, then instances will be 
+                   allocated in the us-east-1f AZ.
+                   Use this option when growing a cluster if you want to 
+                   avoid cross-AZ traffic charges. 
+                   If not specified, the spot fleet request will pick the AZ 
+                   using capacityOptimized strategy, which minimizes the 
+                   chance of interruption.
 EOF
     local cluster=
     local size=
@@ -1815,7 +1865,7 @@ EOF
     local sfr_maxprice=$DEFAULT_SFR_MAXPRICE
     local az=
 
-    while [ $# -gt 0 ]; do
+    while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -c|--cluster)   readopt cluster $@      ; shift ; shift ;;
 	    -n|--size)      readopt size $@         ; shift ; shift ;;
@@ -1880,7 +1930,7 @@ EOF
 	                                                   >$fleet_spec_file    
     local frq=$(aws ec2 request-spot-fleet \
 	      --spot-fleet-request-config file://$fleet_spec_file)
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "failed to launch an AWS spot fleet request"
     fi
 
@@ -1891,12 +1941,14 @@ EOF
     echo "for $size instance(s) with $storage storage."
     echo "Waiting for fulfillment..."
 
+    local attempt
+    
     for attempt in $(seq 1 $NRETRIES); do
-	status=$(aws ec2 describe-spot-fleet-requests \
+	local status=$(aws ec2 describe-spot-fleet-requests \
 		     --spot-fleet-request-ids $frq \
 		     --query 'SpotFleetRequestConfigs[].[ActivityStatus]'\
 		     --output text)
-	if [ $? -ne 0 ]; then
+	if [[ $? -ne 0 ]]; then
 	    exit_error "Failed to get the status of $frq. "\
 		       "Check EC2 console. Exiting..."
 	fi
@@ -1904,7 +1956,7 @@ EOF
 	working=    # have we seen a status other than "None"?
 	case "$status" in
 	    fulfilled) echo $status ; break ;;
-	    None) if [ -n "$working" ]; then
+	    None) if [[ -n "$working" ]]; then
 		      exit_error "Got unexpected status 'None' for the "\
 				 "spot fleet request. Request may have been "\
 				 "cancelled. Check EC2 console. Exiting..."
@@ -1942,7 +1994,7 @@ EOF
 	
 	sleep $PAUSE
     done
-    if [ $attempt -eq $NRETRIES ]; then
+    if [[ $attempt -eq $NRETRIES ]]; then
 	exit_error "Maximum number of retries reached. Check EC2 console. "\
 	           "Exiting..."
     fi
@@ -1965,7 +2017,7 @@ AWS_REGION=us-east-1
 # Set this to the AMI to use for LogDevice nodes. The default AMI works in 
 # us-east-1 region only. If you want to use a different region, you will have 
 # to create a copy of the default AMI in your region.
-NODE_AMI=ami-0d424c954857f3fe5
+NODE_AMI=ami-056ecb341970302d5
 
 # Set this to the AMI to use for Zookeeper nodes (which run on ARM64 instances).
 # The default AMI works in us-east-1 region only. If you want to use a 
@@ -1989,7 +2041,7 @@ SECURITY_GROUP=
 
 EOF
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to create a new awld configuration file $CFGPATH"
     fi
 }
@@ -1997,12 +2049,12 @@ EOF
 
 import_config_file() {
     . $CFGPATH 2>/dev/null
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "Failed to read awld configuration file $CFGPATH"
     fi
 
     for v in AWS_REGION SSH_KEY SECURITY_GROUP NODE_AMI ZK_AMI; do
-	if [ -z "${!v}" ]; then
+	if [[ -z "${!v}" ]]; then
 	    exit_error "Configuration option $v is not set in $CFGPATH."\
 		       "Please set it according to instructions in that file."\
 		       "To reset the config delete $CFGPATH and run awld list."
@@ -2024,18 +2076,18 @@ case "$CMD" in
 esac
 
 (which ssh && which scp && which ssh-add) >/dev/null
-if [ $? -ne 0 ]; then
+if [[ $? -ne 0 ]]; then
     exit_error "failed to find one of the following required utilities "
                "in \$PATH: ssh, scp, ssh-add. Install openssh-client or "
                "equivalent."
 fi
 
-if [ "$CMD" == "help" ]; then
+if [[ "$CMD" == "help" ]]; then
     help $*
     exit
 fi
 
-if [ ! -f $CFGPATH ]; then
+if [[ ! -f $CFGPATH ]]; then
     cat <<EOF
 It appears that you have not yet configured awld, or have deleted or 
 moved its configuration file. I will try to create a new one in 
@@ -2052,7 +2104,7 @@ import_config_file
 # echo "Using AWS region $AWS_DEFAULT_REGION"
 
 ssh-add -l | cut -d ' ' -f 3 | grep -q "^$SSH_KEY\$"
-if [ $? -ne 0 ]; then
+if [[ $? -ne 0 ]]; then
     exit_error "EC2 SSH key '$SSH_KEY' does not appear to be known"\
 	       "to ssh-agent, or the agent is not running. Use "\
 	       "ssh-add <path-to-key> to add the key."
@@ -2061,12 +2113,12 @@ fi
 # process command attributes specified on 2nd line of ${COMMANDS[$CMD]}
 for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
     case "$a" in
-	find-*) s=${a:5} ;;
+	require-*) s=${a:8} ;;
         *) continue ;;
     esac
     if [[ ! ${IIDS[$s]+_} ]]; then
 	2> echo "ABORT: unknown service type $s in "\
-         "find-$s attribute of command specification $CMD"
+         "require-$s attribute of command specification $CMD"
 	exit 1
     fi
 
@@ -2080,14 +2132,14 @@ for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
           'Name=instance-state-name,Values=running,pending,stopping,stopped' \
 	  --query 'Reservations[].Instances[].[InstanceId]' | sort)
 
-    if [ $? -ne 0 ]; then
+    if [[ $? -ne 0 ]]; then
 	exit_error "failed to get the list of instances for shared"\
 		   "service '$s' from EC2."
     fi
 
     if [[ $(ninst $s) -eq 0 && "$CMD" != "allocate-$s" ]]; then
-	exit_error "no instance ids with tag 'logdevice-$s' found. "\
-		   "Use 'awld allocate-$s' to provision service"
+	exit_error "no instances with tag 'logdevice-$s' found. "\
+		   "Use 'awld allocate-$s' to provision service."
     fi
     unset s
 done

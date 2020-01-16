@@ -126,7 +126,9 @@ declare -A COMMANDS=(
     [start]="start logdeviced on one, several, or all nodes in a cluster
               require-zk"
     [start-zk]="start all Zookeeper instances previously created by allocate-zk
-              require-zk"    
+              require-zk"
+    [start-admin]="start administrative services like Prometheus and LD admin server
+              require-admin"    
     [stop]="stop logdeviced on one, several, or all nodes in a cluster"
     [stop-zk]="shut down Zookeeper service and stop all Zookeeper instances, 
               require-zk"
@@ -316,15 +318,64 @@ get_instance_status() {
 # @param $1     : instance id
 # @param $2..$n : commands to execute via bash -c
 run_on_instance() {
-    local iid=$1
-    shift
+    local iid=$1 ; shift
     local cmd="$*"
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -T $SSHOPTS ec2-user@$(aws ec2 describe-instances \
+	    ssh -n -T $SSHOPTS ec2-user@$(aws ec2 describe-instances \
 		       --instance-ids $iid \
 		       --query 'Reservations[].Instances[].PublicDnsName'\
 		       --output text) \
 	$cmd
+}
+
+
+# Forward local ports to an EC2 instance over a background ssh.
+# The instance is expected to be up and accepting ssh connections with
+# key $SSH_KEY. 
+#
+# @param $1     : instance id
+# @param $2..$# : ports to forward. Ports already being forwarded
+#                 over a background ssh are silently skipped.
+forward_ports_to() {
+    local iid=$1 ; shift
+    local fwd=  # port forwarding options to pass to ssh
+    local p
+    
+    local h=$(aws ec2 describe-instances \
+		       --instance-ids $iid \
+		       --query 'Reservations[].Instances[].PublicDnsName'\
+		       --output text)
+
+    if [[ $? -ne 0 ]]; then
+	exit_error "Failed to get host name for instance $iid from EC2"
+    fi
+    
+    for p in "$@"; do
+	case $p in
+	    +([0-9])) ;;
+            *) 2> echo "ABORT: invalid parameter in $FUNCNAME."\
+		"Expected a port number, got $p" ; exit 1 ;;
+        esac
+        # check if ssh forwarding is already set up for local port $p
+        if ps auxwww | awk -v port=$p -v host=$h\
+	 '{ if ($11=="ssh") 
+              for (i=12; i<NF; i++) {
+                 if ($i=="-L" && $(i+1)==port":127.0.0.1:"port) port_seen=1 ;
+                 if ($i=="ubuntu@"host) host_seen=1
+              }
+          } END{ exit port_seen && host_seen ? 0 : 1 }';
+	then
+	    echo "Local port $p is forwarded to $h"
+	else
+	    echo "Forwarding local port $p to $h"
+	    fwd="$fwd -L$p:127.0.0.1:$p"
+	fi
+   done
+
+   if [[ -n $fwd ]]; then
+       ssh -Nf4 -oStrictHostKeyChecking=no \
+	        -oExitOnForwardFailure=yes $fwd ubuntu@$h
+   fi 
 }
 
 
@@ -551,6 +602,72 @@ EOF
 }
 
 
+# Output a Prometheus config file for use one the admin EC2 instance
+# of an awld deployment.
+prometheus_config() {
+    cat <<'EOF'
+global:
+  scrape_interval:     15s # By default, scrape targets every 15 seconds.
+  evaluation_interval: 15s # By default, scrape targets every 15 seconds.
+  # scrape_timeout is set to the global default (10s).
+
+  # Attach these labels to any time series or alerts when communicating with
+  # external systems (federation, remote storage, Alertmanager).
+  external_labels:
+      monitor: 'example'
+
+# Load and evaluate rules in this file every 'evaluation_interval' seconds.
+rule_files:
+  # - "first.rules"
+  # - "second.rules"
+
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any 
+  # timeseries scraped from this config.
+  # Here it's Prometheus itself.
+  - job_name: 'prometheus'
+
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: boxes
+    # scrape node exporter on all logdevice cluster nodes
+    ec2_sd_configs:
+      - region: us-east-1
+        port: 9100
+
+    relabel_configs:
+      - source_labels: [__meta_ec2_tag_logdevice_cluster_name]
+        regex: ".+"
+        action: keep
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+EOF
+}
+
+
+# Output a bash script suitable for use as a UserData (init) script on a
+# newly allocated admin EC2 instance running Prometheus, Grafana, and
+# the LD admin service.
+admin_init_script() {
+    cat <<EOF
+#!/bin/bash
+set -uo pipefail
+
+PATH=/usr/local/bin:/usr/bin:/bin:/sbin
+touch /home/ubuntu/.hushlogin
+EOF
+    echo
+    echo "cat << 'EOF' > /etc/prometheus/prometheus.yml"
+    prometheus_config
+    echo "EOF"
+    echo ""
+}
+
+
 # Compose and output a spot fleet request for logdevice nodes
 #
 # @param $1 cluster     : LogDevice cluster name
@@ -770,7 +887,7 @@ get_nshards() {
     local hostname=$1
      
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -T $SSHOPTS ubuntu@$hostname cat $DATADIR/NSHARDS  </dev/null
+	    ssh -n -T $SSHOPTS ubuntu@$hostname cat $DATADIR/NSHARDS
 }
  
 
@@ -1229,7 +1346,8 @@ EOF
 # or if ssh was unable to connect, or out timed out after $SSH_TIMEOUT,
 # the status string is "failed", "ssh error", or "timed out" respectively.
 #
-# @param $1 cluster  REQUIRED  name of cluster to operate on
+# @param $1 cluster  REQUIRED  name of cluster to operate on. This can also
+#                    be the name of an internal service, such as [admin] or [zk]
 # @param $2..$#      an optional list of rack ids and EC2 instance ids.
 #                    If given, the operation will only be run on those
 #                    racks/instances.
@@ -1247,29 +1365,36 @@ run_on_nodes() {
 	bar='|'
     done
 
+    # the following escapes [ and ] in $cluster
+    local cluster_re=${cluster/\[/\\[}
+    cluster_re=${cluster_re/]/\\]}
+
+    regex="^$cluster_re .*($regex)"
+    
     # iids, locations, and dns names of nodes after filtering
-    nodes=$(list | grep -E "^$cluster .*($regex)")
+    local nodes=$(list | grep -E "$regex")
 
     if [[ -z "$nodes" ]]; then
 	echo "No nodes in cluster '$cluster' match the specified filter"
-	return 0
+	return 1
     fi
 
-    log_file_prefix="/tmp/awld-$$"
+    local log_file_prefix="/tmp/awld-$$"
     rm -f $log_file_prefix-*
     trap "rm -f $log_file_prefix-*" EXIT
     
     # we first set up log files, then start processes in a separate while
     # loop so that they are subprocesses of _this_ shell rather than of a
     # subprocess, and we can wait(1) on them
+    local logfile
     echo "$nodes" | while read -r cn iid itype loc ip hostname roles rest; do
 	logfile="$log_file_prefix-$iid.log"
 	echo $iid $loc $hostname > $logfile
     done
   
-    n=0
+    local n=0
     for logfile in $(ls $log_file_prefix-*.log); do
-	hostname=$(head -n 1 $logfile | cut -d ' ' -f 3)
+	local hostname=$(head -n 1 $logfile | cut -d ' ' -f 3)
 	(echo "$script" | timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
 				  ssh -T $SSHOPTS ubuntu@$hostname 2>&1
 	 case $? in
@@ -1331,11 +1456,12 @@ EOF
 
     # We use 'systemctl enable --now' rather than 'systemctl start' to make
     # start_script() work right after a new node is provisioned.
-    # We call reset-failed before starting the unit in order to override the
-    # StartLimitIntervalSec=20,StartLimitBurst=2 settings. Those settings
-    # limit *all* types of restarts, including manual, to 2 per 20s. We
-    # want automatic restarts rate-limited low, but manual restarts
-    # need not be.
+
+    # NOTE: consider calling reset-failed before starting the unit in
+    # order to override the StartLimitIntervalSec=20,StartLimitBurst=2
+    # settings. Those settings limit *all* types of restarts,
+    # including manual, to 2 per 20s. We want automatic restarts
+    # rate-limited low, but manual restarts need not be.
 }
 
 
@@ -1371,8 +1497,6 @@ parse_cluster_filter() {
 }
 
 
-# perform an operation (start, stop, status, etc) concurrently on all or a
-# subset of nodes in a cluster
 start() {
     [[ ${1-} == help ]] && cat <<EOF && return    
    start           
@@ -1512,6 +1636,48 @@ EOF
 }
 
 
+# Output a bash script that when executed on the admin instance as user ubuntu
+# will check if prometheus.service is active, and if it is not, start the
+# service.
+admin_start_script() {
+    cat <<'EOF'
+  systemctl is-active prometheus ||\
+  sudo systemctl enable --quiet --now prometheus && echo started
+EOF
+}
+
+
+start-admin() {
+    [[ ${1-} == help ]] && cat <<EOF && return
+   start-admin
+
+   Start all administrative services on the EC2 instance previously allocated
+   by allocate-admin. This includes Prometheus, Grafana, as well as one 
+   ld-admin-server process for each LogDevice cluster created by AWLD.
+   Services that are already running are not restarted. The command also
+   forwards local port 9090 to the admin instance over ssh for convenient and
+   secure access to Prometheus.
+EOF
+    local n_admin=$(ninst admin)
+    if [[ $n_admin -ne 1 ]]; then
+	2> echo "ABORT: $FUNCNAME expected 1 admin instance, got $n_admin."
+	exit 1
+    fi
+
+    echo "Checking that administrative instance is up and running"
+
+    wait_up ${IIDS[admin]} || exit
+
+    echo "Starting Prometheus and other administrative services"
+
+    admin_start_script | run_on_nodes '[admin]' ${IIDS[admin]} || exit
+    
+    forward_ports_to ${IIDS[admin]} 9090 || exit
+
+    echo "Success. You can access Prometheus at http://localhost:9090/"
+}
+
+
 # output a zoo.cfg file for a Zookeeper instance
 zoo_cfg() {
     cat <<EOF
@@ -1616,8 +1782,15 @@ EOF
 	 "monitoring and admin services."
     echo
 
+    local udfile="/tmp/awld-admin-user-data-$$"
     local errfile="/tmp/awld-run-instances-$$.err"
-    trap "rm -f $errfile" EXIT
+    trap "rm -f $udfile $errfile" EXIT
+
+    rm -f $udfile && admin_init_script > $udfile && test -r $udfile
+
+    if [[ $? -ne 0 ]]; then
+	exit_error "Failed to write instance initialization script into $udfile"
+    fi
     
     aws ec2 run-instances --count 1 \
 	--image-id $NODE_AMI \
@@ -1627,6 +1800,7 @@ EOF
 	--iam-instance-profile Name=$NODE_INSTANCE_PROFILE \
 	--tag-specifications \
  	'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]' \
+	--user-data file://$udfile \
 	2>$errfile
 
     if [[ $? -ne 0 ]]; then
@@ -1727,8 +1901,8 @@ EOF
 	echo "Restarting Zookeeper on instance $iid"
 	echo "($hostname)"
 	trap "rm -f /tmp/start-zk-$iid" EXIT
-	</dev/null timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	     ssh -T $SSHOPTS ec2-user@$hostname "\
+	timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
+	     ssh -n -T $SSHOPTS ec2-user@$hostname "\
 		/opt/zookeeper/bin/zkServer.sh stop \
 		&& sleep 2 \
 		&& /opt/zookeeper/bin/zkServer.sh start" \

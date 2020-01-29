@@ -241,14 +241,29 @@ check_ssh_key() {
     local keypairs="$(aws ec2 describe-key-pairs | cut -f 3)"
 
     if [[ $? -ne 0 ]]; then
-	exit_error "Failed to list key pairs registered with AWS for this user"
+	exit_error "Failed to list SSH keys registered with AWS for this user"
     fi
-
-    if ! echo "$keypairs" | grep -q "^$(basename $SSH_KEY)\$"; then
-	echo "The file name of SSH_KEY specified in $CFGPATH"
-        echo "($SSH_KEY)"
-        echo "does not match any of the keys registered with AWS for this user:"
-	echo "$keypairs"
+   
+    if [[ -z $keypairs ]]; then
+	cat <<EOF
+ERROR: no SSH keys appear to be registered with AWS for this user.
+       Use AWS console or aws ec2 import-key-pair command to
+       register a keypair, then put the path to the private key in
+       the SSH_KEY setting in the awld config file $CFGPATH. The file name
+       must match the name under which you register the keypair.
+EOF
+	exit 1
+    elif ! echo "$keypairs" | grep -q "^$(basename $SSH_KEY)\$"; then
+	cat <<EOF
+ERROR: the file name part '$(basename $SSH_KEY)' of SSH_KEY='$SSH_KEY'
+       set in the awld config file $CFGPATH 
+       does not match the following SSH key names that AWS has for this user:
+---
+$keypairs
+---
+       Use AWS console or aws ec2 import-key-pair command to register a key,
+       or rename your key file to match its AWS keypair name.
+EOF
 	exit 1
     fi
 }
@@ -963,7 +978,7 @@ nodes_and_internal_config() {
 	    exit 1
 	fi
 	if [[ $nid -ge $NODES_MAX ]]; then
-	    error_exit "Cluster $cluster has too many nodes. "\
+	    exit_error "Cluster $cluster has too many nodes. "\
 		       "Limit is $NODES_MAX."
 	fi
 	nshards=$(get_nshards $hostname)
@@ -2380,14 +2395,19 @@ EOF
     return $upload_status
 }
 
-
-# @param $1  object
-# @param $2  cluster
-# @param $3  filter
+# Install one of the awld packages in packages.awld.* S3 bucket on the
+# specified nodes. 
+#
+# @param $1  object   an S3 URL of the object containing the package to install
+# @param $2  cluster  name of cluster on whose nodes to install package
+# @param $3  filter   optional list of rack and instance ids limiting the
+#                     set of nodes on which to install the package
 install_package_on_nodes() {
     local object=$1    
     local cluster=$2
     local filter=${3-}
+
+    
 }
 
 

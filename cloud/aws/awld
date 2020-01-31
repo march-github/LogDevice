@@ -97,9 +97,14 @@ declare -r LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
 declare -r SSH_TIMEOUT="2m" # timeout(1) for remote commands over ssh
 declare -r SSH_KILL_AFTER="3m"  # SIGKILL ssh after this much time
 
-# Path to current logdevice package on nodes. This is a symlink to the
-# current package directory, e.g. /opt/logdevice -> /opt/logdevice-2.26-5
-declare -r LOGDEVICE_PACKAGE_DIR="/opt/logdevice" 
+# The names of labelled packages start with this prefix.
+declare -r RELEASE_PREFIX="logdevice-"
+
+# The names of anonymous build packages start with this prefix.
+declare -r BUILD_PREFIX="build-"
+
+# Root directory for the tree of LogDevice packages on cluster nodes.
+declare -r PACKAGES_ROOT="/opt/logdevice"
 
 # timeout(1) for aws s3 operations while uploading and downloading packages
 declare -r PACKAGE_S3_TIMEOUT="5m"   # send SIGINT after this time elapses
@@ -221,7 +226,8 @@ tracelog() {
 # Returns 0 on success, a non-zero status code if bucket name file could
 # not be read or written.
 packages_bucket() {
-    local account_id=$(aws sts get-caller-identity \
+    local account_id
+    account_id=$(aws sts get-caller-identity \
 			   --query Account --output text)
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get this user's account id from AWS."
@@ -403,8 +409,9 @@ forward_ports_to() {
     local iid=$1 ; shift
     local fwd=  # port forwarding options to pass to ssh
     local p
-    
-    local h=$(aws ec2 describe-instances \
+
+    local h
+    h=$(aws ec2 describe-instances \
 		       --instance-ids $iid \
 		       --query 'Reservations[].Instances[].PublicDnsName'\
 		       --output text)
@@ -453,6 +460,7 @@ wait_up() {
     # wait until all instances finish initialization or NRETRIES is reached
     for iid in "$@"; do
 	echo "Checking instance $iid"
+	local st
 	for attempt in $(seq 1 $NRETRIES); do
 	      st=$(get_instance_status $iid)
 	      if [[ $? -ne 0 ]]; then
@@ -781,9 +789,9 @@ spot_fleet_request() {
 	*) >&2 echo "ABORT: invalid storage type '$storage' in $FUNCNAME" ;
 	   exit 1 ;;
     esac
-    
-    local account=$(aws sts get-caller-identity \
-			--query Account --output text)
+
+    local account
+    account=$(aws sts get-caller-identity --query Account --output text)
     if [[ $? -ne 0 || -z "$account" ]]; then
 	exit_error "Failed to get AWS account id for this user."\
 		   "Run aws configure."
@@ -1202,19 +1210,22 @@ EOF
 	local prettyprinter="cat"
     fi
 
-    local nodes=$(list)
+    local nodes
+    nodes=$(list)
 
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of nodes for"\
 		   "cluster '$cluster' from AWS"
     fi
-    
-    local zkinsts=$(echo "$nodes" | awk '/^\[zk\]/{print $2"\t"$5"\t"$6}')
+
+    local zkinsts
+    zkinsts=$(echo "$nodes" | awk '/^\[zk\]/{print $2"\t"$5"\t"$6}')
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
-    
-    local zookeeper=$(echo "$zkinsts" | zk_client_config)
+
+    local zookeeper
+    zookeeper=$(echo "$zkinsts" | zk_client_config)
     if [[ $? -ne 0 || -z "$zookeeper" ]]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
@@ -1234,8 +1245,9 @@ EOF
 	    grep ",\"cluster\":\"$cluster\"," | $prettyprinter
 	exit
     fi
-   
-    local cluster_nodes=$(echo "$nodes" | grep "^$cluster ")
+
+    local cluster_nodes
+    cluster_nodes=$(echo "$nodes" | grep "^$cluster ")
 
     if [[ $? -ne 0 ]]; then
 	exit_error "No nodes found for cluster '$cluster' in this AWS region."
@@ -1327,7 +1339,8 @@ EOF
        exit_error "missing or empty cluster name. Use --cluster <name>."
     fi
 
-    local nodes=$(list)
+    local nodes
+    nodes=$(list)
 
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to list LogDevice EC2 instances"
@@ -1335,7 +1348,8 @@ EOF
 
     # $matching is a list of newline-separated records with the following
     # fields: iid rack-id [sfr]
-    local matching=$(echo "$nodes" | awk -v cluster="$cluster" -v rack="$rack" \
+    local matching
+    matching=$(echo "$nodes" | awk -v cluster="$cluster" -v rack="$rack" \
 	  '{ if ($1==cluster) {
                if (split($4, loc, "[.]") != 5) exit 1;
                if (!rack || loc[5]==rack) print $2" "loc[5]" "$8;
@@ -1409,7 +1423,8 @@ EOF
 # the status string is the last line output by the remote script, or
 # "success" if the script output nothing. If a failure code is returned,
 # or if ssh was unable to connect, or out timed out after $SSH_TIMEOUT,
-# the status string is "failed", "ssh error", or "timed out" respectively.
+# the status string is "failed:", "ssh error:", or "timed out:" respectively,
+# followed by the last line output by the script to stderr or stdout (if any).
 #
 # @param $1 cluster  REQUIRED  name of cluster to operate on. This can also
 #                    be the name of an internal service, such as [admin] or [zk]
@@ -1461,12 +1476,12 @@ run_on_nodes() {
     for logfile in $(ls $log_file_prefix-*.log); do
 	local hostname=$(head -n 1 $logfile | cut -d ' ' -f 3)
 	(echo "$script" | timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-				  ssh -T $SSHOPTS ubuntu@$hostname 2>&1
+				  ssh -T $SSHOPTS ubuntu@$hostname bash 2>&1
 	 case $? in
 	     0) ;; # remote script is expected to supply status on success
-	     124) echo "timedout";;
-	     255) echo "ssh-error" ;;
-	     *) echo "failed";;
+	     124) echo "...timedout";;
+	     255) echo "...ssh-error" ;;
+	     *) echo " ...failed";;
 	 esac) >> $logfile &
 	((n++))
     done
@@ -1489,10 +1504,14 @@ run_on_nodes() {
 
     for logfile in $(ls $log_file_prefix-*.log); do
 	awk '{ printf "%s : ", $1; exit }' $logfile
-	case "$(tail -q -n 1 $logfile)" in
-	    failed) echo -n "failed : " ; next_to_last_line $logfile ;;
-	    timedout) echo -n "timed out : " ; next_to_last_line $logfile ;;
-	    ssh-error) echo -n "ssh error : " ; next_to_last_line $logfile ;;
+	declare -l lastline="$(tail -q -n 1 $logfile)"
+	case "$lastline" in
+	    ...failed) echo -n "failed : " ; next_to_last_line $logfile ;;
+	    *...failed) echo -n "failed : ${lastline:0:-9}" ;;
+	    ...timedout) echo -n "timed out : "; next_to_last_line $logfile ;;
+	    *...timedout) echo -n "timed out : ${lastline:0:-11}" ;;
+	    ...ssh-error) echo -n "ssh error : ";next_to_last_line $logfile ;;
+	    *...ssh-error) echo -n "ssh error : ${lastline:0:-12}" ;;
 	    *) awk 'END{if (NR>1) print $0; else print "success" }' $logfile ;;
 	    # success, print last line, or "success" if log file contains
 	    # nothing but header
@@ -1595,13 +1614,15 @@ EOF
     if [[ -z "$cluster" ]]; then
        exit_error "missing or empty cluster name. Use --cluster <name>."
     fi    
-    
-    local zkinsts=$(zk_running)
+
+    local zkinsts
+    zkinsts=$(zk_running)
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the list of Zookeeper hosts from EC2"
     fi
-    
-    local zookeeper=$(echo "$zkinsts" | zk_client_config)
+
+    local zookeeper
+    zookeeper=$(echo "$zkinsts" | zk_client_config)
     if [[ $? -ne 0 || -z "$zookeeper" ]]; then
 	exit_error "not enough Zookeeper instances are reported up by EC2."\
 		   "Expected $(ninst zk) instances, got '$zookeeper'."\
@@ -1618,8 +1639,8 @@ EOF
 
     # expecting to get an empty string if config znode exists, or
     # a "Node does not exist:" error.
-    local zkerr=$(echo "ls /conf/${cluster}.conf" | \
-		      zkcli $zkhost 2>&1 1>/dev/null)
+    local zkerr
+    zkerr=$(echo "ls /conf/${cluster}.conf" | zkcli $zkhost 2>&1 1>/dev/null)
     case "$?" in
 	0) ;;
 	1) if echo $zkerr | grep -q "Node does not exist:"; then
@@ -1699,7 +1720,7 @@ EOF
     while [[ $# -gt 0 ]]; do
 	case "$1" in
 	    -l|--long) ((long++)) ;;
-	    *) args="$args '$1'" ;;
+	    *) args="$args $1" ;;
 	esac
 	shift
     done    
@@ -1941,7 +1962,8 @@ EOF
     
     # Generate a dynamic config file.
 
-    local zkdyncfg=$(echo "$zkinsts" | awk -v cport=$ZKCLTPORT \
+    local zkdyncfg
+    zkdyncfg=$(echo "$zkinsts" | awk -v cport=$ZKCLTPORT \
 		      '{printf "server.%s=%s:2182:2183;"cport"\n", NR, $2}')
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get Zookeeper instance attributes. Exiting..."
@@ -2012,9 +2034,10 @@ stop-zk() {
   stop all AWS instances provisioned for Zookeeper, terminate zookeeper servers
   on them.
 EOF
- 
+
+    local st
     for iid in ${IIDS[zk]}; do    
-	local st=$(get_instance_status $iid)
+	st=$(get_instance_status $iid)
 	if [[ $? -ne 0 ]]; then
 	    echo "Failed to get instance status for $iid"
 	    exit 1
@@ -2182,14 +2205,16 @@ EOF
 	exit_error "This command requires /usr/bin/gawk, which does not"\
  	             "appear to be installed."
     fi	
-    
-    local fleet_spec_file=$(mktemp /tmp/awld.XXXXXX)
-    trap "rm $fleet_spec_file" EXIT
+
+    local fleet_spec_file
+    fleet_spec_file=$(mktemp /tmp/awld.XXXXXX)
+    trap "rm -f $fleet_spec_file" EXIT
     
     spot_fleet_request\
 	$cluster $size $storage $sfr_duration $sfr_maxprice "$az"\
 	                                                   >$fleet_spec_file    
-    local frq=$(aws ec2 request-spot-fleet \
+    local frq
+    frq=$(aws ec2 request-spot-fleet \
 	      --spot-fleet-request-config file://$fleet_spec_file)
     if [[ $? -ne 0 ]]; then
 	exit_error "failed to launch an AWS spot fleet request"
@@ -2205,9 +2230,10 @@ EOF
     echo "Waiting for fulfillment..."
 
     local attempt
+    local status
     
     for attempt in $(seq 1 $NRETRIES); do
-	local status=$(aws ec2 describe-spot-fleet-requests \
+	status=$(aws ec2 describe-spot-fleet-requests \
 		     --spot-fleet-request-ids $frq \
 		     --query 'SpotFleetRequestConfigs[].[ActivityStatus]'\
 		     --output text)
@@ -2234,9 +2260,10 @@ EOF
 		    --spot-fleet-request-ids $frq\
 		    --terminate-instances
 		echo "Querying AWS for error details..."
+		local history
 		while [[ $attempt -lt $NRETRIES ]]; do
 		    sleep $PAUSE
-		    local history=$(aws ec2 describe-spot-fleet-request-history\
+		    history=$(aws ec2 describe-spot-fleet-request-history\
 		                    --spot-fleet-request-id $frq\
 		                    --start-time 2000-01-01T00:00:00Z)
 		    if echo "$history" | grep "fleetProgressHalted"; then
@@ -2267,15 +2294,18 @@ EOF
 # Output the full URL of S3 object for a package specified by the flags passed
 # to the 'create' or 'install' subcommands of 'awld package' command.
 #
-# @param $1  version    optional version label
-# @param $2  dbg        empty for release pacakges, a debug suffix (currently
-#                       only "-dbg") if a debug mode package is requested
+# @param $1  version    version label. If empty, an anonymous "build-$TS"
+#                       package name will be created. TS is the current time.
+# @param $2  dbg        empty for packages containing optimized code, a debug
+#                       suffix (currently only "-dbg" is supported) if a debug
+#                       mode (unoptimized) package is requested
 s3_package_url() {
-    local version={$1-}
-    local dbg={$2-}
+    local version=$1
+    local dbg=${2-}
     local name= # package name
+    local bucket
     
-    local bucket=$(packages_bucket)
+    bucket=$(packages_bucket)
 
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to get the name of S3 bucket for packages."
@@ -2285,18 +2315,20 @@ s3_package_url() {
     fi
     
     if [[ -n $version ]]; then
-	if [[ $version =~ [[:space:]] ]]; then
-	    exit_error "Invalid --version value: '$version'."\
+	if [[ ! $version =~ ^[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$ ]];
+	then
+	    exit_error "invalid --version value: '$version'."\
  		       "Expected major.minor.patch"
 	fi
- 	name="logdevice-$version$dbg"
+ 	name="$RELEASE_PREFIX$version$dbg"
     else
-	local timestamp=$(TZ='America/Los_Angeles' date +'%F_%T')
+	local timestamp
+	timestamp=$(TZ='America/Los_Angeles' date +'%F_%T')
 	if [[ $? -ne 0 || -z $timestamp ]]; then
 	    2> echo "ABORT: Failed to generate a timestamp"
 	    exit 1
 	fi
-	name="build-$timestamp$dbg"
+	name="$BUILD_PREFIX$timestamp$dbg"
     fi
 
     echo "$bucket/$name"
@@ -2367,7 +2399,8 @@ EOF
 	fi
     done    
 
-    local object=$(s3_package_url "$version" $dbg)
+    local object
+    object=$(s3_package_url "$version" $dbg) || exit
     
     echo "Building package $(basename $object)"
     echo "and uploading it to $object"
@@ -2395,19 +2428,63 @@ EOF
     return $upload_status
 }
 
-# Install one of the awld packages in packages.awld.* S3 bucket on the
-# specified nodes. 
-#
-# @param $1  object   an S3 URL of the object containing the package to install
-# @param $2  cluster  name of cluster on whose nodes to install package
-# @param $3  filter   optional list of rack and instance ids limiting the
-#                     set of nodes on which to install the package
-install_package_on_nodes() {
-    local object=$1    
-    local cluster=$2
-    local filter=${3-}
 
+# This function is intended to be run on a LogDevice cluster node via
+# run_on_nodes() in order to install an awld package on that node. Its
+# stdout is expected to be piped to a local logger, e.g., via systemd-cat.
+#
+# If the package is already present on the node, do not pull it again.
+# Otherwise copy the tar.gz package from $object and unpack it into
+# $PACKAGES_ROOT/<package-name>. Once the specified package has
+# been successfully pulled from S3 (or found to be present), set the
+# $PACKAGES_ROOT/current symlink to point to the root directory of the package.
+#
+# @param $1  object  an S3 URL of the object containing the package to install
+# @param $2  packages_root  the value of $PACKAGES_ROOT
+#
+install_package_on_node() {
+    declare -r object=$1
+    declare -r packages_root=$2
+    declare -r name=$(basename $object)  # name of package   
     
+    # Path to current logdevice package on nodes. This is a symlink to the
+    # current package directory, e.g.
+    # /opt/logdevice/current -> /opt/logdevice/logdevice-2.26.5
+    declare -r current_symlink=$packages_root/current
+
+    echo "installing $object"
+
+    if [[ ${object:0:19} != "s3://packages.awld." ]]; then
+	>&2 echo "ABORT: invalid S3 URL '$object' passed to $FUNCNAME"
+	exit 1
+    fi
+    
+    if [[ ! ( -d $packages_root && -w $packages_root ) ]]; then
+	>&2 echo "Packages directory $packages_root does not exist or "\
+	 "is not writable"
+	exit 1
+    fi
+    
+    cd $packages_root || exit
+   
+    if [[ -a $name ]]; then
+	echo "package directory exists"
+    else
+	echo "downloading package from S3"
+	local tgz
+	tgz=$(mktemp /tmp/awld.XXXXXX) || exit
+	trap "rm -f $tgz" EXIT
+	
+	aws s3 cp --only-show-errors $object $tgz       &&\
+	gzip -t $tgz                                    &&\
+	mkdir $name                                     &&\
+	tar --force-local -C $name -xzf $tgz            || exit
+	rm -f $tgz
+    fi
+
+    echo "setting $packages_root/current -> $name"
+    
+    ln -sfn $name current || exit	
 }
 
 
@@ -2421,12 +2498,12 @@ package-install() {
                of the affected nodes. 
 
                With --version v the command will attempt to install the package
-               named logdevice-<v>[-dbg]. The -dbg suffix will be added 
+               named ${RELEASE_PREFIX}<v>[-dbg]. The -dbg suffix will be added 
                if --debug is also present.
 
                Without --version the operation will install the latest package
-               matching the build-<TS>[-dbg] pattern. <TS> is the creation 
-               timestamp. "-dbg" is added if --debug option is passed. 
+               matching the ${BUILD_PREFIX}<TS>[-dbg] pattern. <TS> is the 
+               creation timestamp. "-dbg" is added if --debug option is passed. 
                A matching package with the highest timestamp will be selected.
 EOF
 
@@ -2440,7 +2517,7 @@ EOF
 	case "$1" in
 	    -g|--debug) dbg="-dbg" ; shift ;;
             -v|--version) readopt version "$@" ; shift ; shift ;;
-	    *) args="$args '$1'" ; shift ;;
+	    *) args="$args $1" ; shift ;;
 	esac
     done
     
@@ -2448,22 +2525,49 @@ EOF
 
     validate_cluster_name $cluster
     
-    local object=$(s3_package_url "$version" $dbg)
-    local bucket=$(dirname $object)
-    local package=$(basename $object)
-
-    local package_list="$(aws s3 ls $bucket)"
-
-    if [[ $? -ne 0 ]]; then
-	exit_error "Failed to list contents of packages bucket $bucket"
-    fi
-
-    if ! echo "$package_list" |\
-	    awk -v n=$package '{if ($4==n) return 0} END{return 1}'; then    
-	exit_error "Unknown package: $package"
-    fi
+    local object
+    object=$(s3_package_url "$version" $dbg) || exit
     
-    install_package_on_nodes $object $cluster $filter
+    declare -r bucket=$(dirname $object)
+    local package # package name
+
+    if [[ -z $bucket ]]; then
+	>&2 echo "ABORT: empty value of \$bucket in $FUNCNAME. "\
+	    "Expected s3://..."
+	exit 1
+    fi    
+    
+    declare -r package_list="$(aws s3 ls $bucket)"   
+    if [[ $? -ne 0 ]]; then
+	exit_error "Failed to list contents of package bucket $bucket"
+    fi
+
+    if [[ -z $version ]]; then
+	# install most recent build-* or build-*-dbg package
+        declare -r pattern="^$BUILD_PREFIX[0-9:_-]+$dbg\$"
+	package=$(echo "$package_list" |\
+		          awk "{if (\$4 ~ /$pattern/) m=\$4} END{print m}")
+	if [[ -z $package ]]; then
+	    if [[ -z $dbg ]]; then
+		exit_error "no optimized builds available"
+	    else
+		exit_error "no debug builds available"
+	    fi
+	fi
+    else
+	package=$(basename $object)
+	if ! echo "$package_list" | awk -v n="$package"\
+				     '{if ($4==n) m=1} END{exit m?0:1}'; then
+	    exit_error "unknown package: $package"
+	fi
+    fi
+
+    install_package_on_node $bucket/$package $PACKAGES_ROOT  #DEBUG
+    
+#~DEBUG
+#    (declare -f install_package_on_node
+#     echo "install_package_on_node $object $PACKAGES_ROOT | systemd-cat -t awld"
+#    ) | run_on_nodes $cluster $filter
 }
 
 
@@ -2484,12 +2588,14 @@ EOF
 	# if we get here, --cluster was not given, nor were there
 	# any rack or instance ids given. List the bucket.
 
-	local bucket=$(packages_bucket)
+	local bucket
+	bucket=$(packages_bucket) || exit
 
 	aws s3 ls $bucket
     else
 	validate_cluster_name $cluster
-	echo "ls -l /opt/logdevice/current" | run_on_nodes $cluster $filter
+	echo "ls -l $PACKAGES_ROOT/current | grep -o 'current ->.*\$'"\
+	    | run_on_nodes $cluster $filter
     fi    
 }
 
@@ -2514,8 +2620,8 @@ $(package-list help)
                          Look for binaries in _build/Debug subdirectory of
                          \$LOGDEVICE_ROOT_DIR.
                                        
-       -v|--version <maj.min-patch>    Create or install a "release" package 
-                                       named logdevice-<maj.min-patch>[-dbg].
+       -v|--version <maj.min.patch>    Create or install a "release" package 
+                                       $RELEASE_PREFIX<maj.min.patch>[-dbg].
 
        -c|--cluster <name>   Required for 'install' subcommand, optional for
                              'list'. Name of cluster on which to operate.

@@ -43,6 +43,7 @@ declare -Ar INSTANCE_TYPES=(
     [ssd]="m5ad.4xlarge r5dn.4xlarge r5d.4xlarge\
            m5dn.4xlarge m5d.4xlarge r5ad.4xlarge"
     [hdd]="h1.4xlarge d2.2xlarge"
+    [none]="t2.medium"   # used for testing awld
     [zk]="a1.large"
     [admin]="t2.medium"
 )
@@ -61,7 +62,7 @@ declare -r \
 
 # Name of EC2 instance profile to use when creating node and admin instances.
 # The profile is expected to contain role "AWLD" containing
-# AmazonEC2ReadOnlyAccess policy.
+# AmazonEC2ReadOnlyAccess policy
 declare -r NODE_INSTANCE_PROFILE="AWLD"
 
 # This map describes provisioned instances of shared services, grouped by
@@ -218,25 +219,37 @@ tracelog() {
 }
 
 
+# Output the numeric id of AWS account configured for use by awscli
+# in the environment of awld process or in ~/.aws/credentials. This is
+# the account that awld "runs as". On failure, log an error to stderr and
+# abort the script.
+account_id() {
+    local aid
+    aid=$(aws sts get-caller-identity --query Account --output text)
+    if [[ $? -ne 0 ]]; then
+	exit_error "Failed to get this user's AWS account id."\
+		   "Have you run aws configure?"
+    elif [[ ! $aid =~ ^[[:digit:]]+$ ]]; then
+	exit_error "Got an invalid account id '$aid' from AWS."\
+	           "Expected a number."
+    fi
+
+    echo $aid
+}
+
+
 # Output the name of S3 bucket used for package deployment.
-# The format is s3://packages.awld.$AWS_REGION.$USER_ID
-# where AWS_REGION is from ~/.awld config file, $USER_ID is the
-# AWS id of user running awld.
+# The format is s3://packages.awld.$AWS_REGION.$ACCOUNT_ID
+# where AWS_REGION is from ~/.awld config file, $ACCOUNT_ID is the numeric id
+# of AWS account that awld runs as.
 #
 # Returns 0 on success, a non-zero status code if bucket name file could
 # not be read or written.
 packages_bucket() {
-    local account_id
-    account_id=$(aws sts get-caller-identity \
-			   --query Account --output text)
-    if [[ $? -ne 0 ]]; then
-	exit_error "Failed to get this user's account id from AWS."
-    elif [[ ! $account_id =~ ^[[:digit:]]+$ ]]; then
-	exit_error "Got an invalid account id '$account_id' from AWS."\
-	           "Expected a number."
-    fi
+    local aid
+    aid=$(account_id) || exit
 	
-    echo "s3://packages.awld.$AWS_DEFAULT_REGION.$account_id"
+    echo "s3://packages.awld.$AWS_DEFAULT_REGION.$aid"
 }
 
 
@@ -485,7 +498,8 @@ wait_up() {
 # a LogDevice node. This script is what logdeviced.service systemd unit
 # executes.
 logdevicedctl() {
-    local substitute='$LOGDEVICECONFIG_LOC $PORT_CLIENT $PORT_COMMAND $DATADIR'
+    local substitute='$LOGDEVICECONFIG_LOC $PORT_CLIENT 
+                      $PORT_COMMAND $DATADIR $PACKAGES_ROOT'
     local v
     
     for v in $(envsubst -v "$substitute"); do export $v; done
@@ -507,11 +521,19 @@ case "${1-}" in
        exit 1       
      fi
      ulimit -Sc unlimited
-     /usr/local/bin/logdeviced \
-         --config-path  $(cat $LOGDEVICECONFIG_LOC) \
-         --port $PORT_CLIENT \
-         --command-port $PORT_COMMAND \
-         --local-log-store-path=$DATADIR/ &
+     LOGDEVICED=$PACKAGES_ROOT/current/bin/logdeviced
+     if [[ ! -h $PACKAGES_ROOT/current ]]; then
+       >&2 echo "ERROR: $PACKAGES_ROOT/current does not exist or not a symlink"
+       exit 1
+     fi
+     if [[ ! -x $LOGDEVICED ]]; then
+       >&2 echo "ERROR: $(readlink -m $LOGDEVICED) not found or not executable"
+       exit 1
+     fi
+     $LOGDEVICED --config-path  $(cat $LOGDEVICECONFIG_LOC) \
+                 --port $PORT_CLIENT \
+                 --command-port $PORT_COMMAND \
+                 --local-log-store-path=$DATADIR/ &
      logdeviced_pid=$!
      echo $logdeviced_pid > /run/logdeviced.pid
      while [[ $(date +%s) -le $deadline ]]; do
@@ -652,7 +674,19 @@ EOF
 
 # Output a bash script suitable for use as a UserData (init) script on a
 # newly allocated EC2 instance running a LogDevice node.
+#
+# @param   $1   storage_type  one of $STORAGE_TYPES constants (ssd,hdd, or none)
+#                             identifying the type of storage subsystem to
+#                             be initialized
 node_init_script() {
+    local storage_type=$1
+
+    case "$storage_type" in
+	@($STORAGE_TYPES)) ;;
+        *) >&2 echo "ABORT: invalid storage type '$storage_type' in $FUNCNAME"\
+	       "expected one of $STORAGE_TYPES" ;;
+    esac
+    
     cat <<EOF
 #!/bin/bash
 set -uo pipefail
@@ -668,8 +702,10 @@ EOF
     logdevicedctl
     echo "EOF"
     echo "chmod a+x $LOGDEVICEDCTL"
-    echo
-    shard_init_script
+    if [[ $storage_type != "none" ]]; then
+	echo
+	shard_init_script
+    fi
 }
 
 
@@ -781,25 +817,20 @@ spot_fleet_request() {
     if [[ "$storage" != "none" ]]; then
 	tags="$tags, {\"Key\": \"logdevice-storage\", \"Value\": \"\"}"
     fi
-    
-    case $storage in
-	ssd|hdd) instance_types=${INSTANCE_TYPES[$storage]} ;;
-	none) >&2 echo "ABORT: allocating sequencer-only nodes requested,"\
-		"but is not yet supported in $FUNCNAME" ; exit 1 ;;
+
+    case "$storage" in
+	@($STORAGE_TYPES)) instance_types=${INSTANCE_TYPES[$storage]} ;;
 	*) >&2 echo "ABORT: invalid storage type '$storage' in $FUNCNAME" ;
 	   exit 1 ;;
     esac
 
     local account
-    account=$(aws sts get-caller-identity --query Account --output text)
-    if [[ $? -ne 0 || -z "$account" ]]; then
-	exit_error "Failed to get AWS account id for this user."\
-		   "Run aws configure."
-    fi
+    account=$(account_id) || exit
 
     check_ssh_key
     
-    local rack=$(unique_id)
+    local rack
+    rack=$(unique_id) || exit_error "Failed to generate a GUID."
     
     cat <<EOF
 {
@@ -823,6 +854,9 @@ EOF
     {
       "ImageId": "$NODE_AMI",
       "InstanceType": "$it",
+      "IamInstanceProfile": {
+          "Name": "$NODE_INSTANCE_PROFILE"
+      },
       "TagSpecifications": [
         {
 	  "ResourceType": "instance",
@@ -849,7 +883,7 @@ EOF
 	fi
 	
 	cat <<EOF
-      "UserData": "$(node_init_script | base64 -w 0)"
+      "UserData": "$(node_init_script $storage | base64 -w 0)"
     }      
 EOF
     done    
@@ -1481,7 +1515,7 @@ run_on_nodes() {
 	     0) ;; # remote script is expected to supply status on success
 	     124) echo "...timedout";;
 	     255) echo "...ssh-error" ;;
-	     *) echo " ...failed";;
+	     *) echo "...failed";;
 	 esac) >> $logfile &
 	((n++))
     done
@@ -1502,9 +1536,10 @@ run_on_nodes() {
     # all ssh sessions have finished execution or timed out
     # report results
 
+    local lastline
     for logfile in $(ls $log_file_prefix-*.log); do
 	awk '{ printf "%s : ", $1; exit }' $logfile
-	declare -l lastline="$(tail -q -n 1 $logfile)"
+	lastline="$(tail -q -n 1 $logfile)"
 	case "$lastline" in
 	    ...failed) echo -n "failed : " ; next_to_last_line $logfile ;;
 	    *...failed) echo -n "failed : ${lastline:0:-9}" ;;
@@ -2472,9 +2507,13 @@ install_package_on_node() {
     else
 	echo "downloading package from S3"
 	local tgz
-	tgz=$(mktemp /tmp/awld.XXXXXX) || exit
-	trap "rm -f $tgz" EXIT
-	
+	tgz=$(mktemp /tmp/awld.XXXXXX)
+	if [[ -w $tgz && -r $tgz ]]; then
+	    trap "rm -f $tgz" EXIT
+	else
+	    >&2 echo "ABORT: mktemp /tmp/awld.XXXXX failed"
+	    exit 1
+	fi	
 	aws s3 cp --only-show-errors $object $tgz       &&\
 	gzip -t $tgz                                    &&\
 	mkdir $name                                     &&\
@@ -2525,7 +2564,7 @@ EOF
 
     validate_cluster_name $cluster
     
-    local object
+    local object # provisional, may be adjusted
     object=$(s3_package_url "$version" $dbg) || exit
     
     declare -r bucket=$(dirname $object)
@@ -2537,7 +2576,8 @@ EOF
 	exit 1
     fi    
     
-    declare -r package_list="$(aws s3 ls $bucket)"   
+    local package_list
+    package_list="$(aws s3 ls $bucket)"   
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to list contents of package bucket $bucket"
     fi
@@ -2554,6 +2594,7 @@ EOF
 		exit_error "no debug builds available"
 	    fi
 	fi
+	object="$bucket/$package"
     else
 	package=$(basename $object)
 	if ! echo "$package_list" | awk -v n="$package"\
@@ -2561,13 +2602,10 @@ EOF
 	    exit_error "unknown package: $package"
 	fi
     fi
-
-    install_package_on_node $bucket/$package $PACKAGES_ROOT  #DEBUG
     
-#~DEBUG
-#    (declare -f install_package_on_node
-#     echo "install_package_on_node $object $PACKAGES_ROOT | systemd-cat -t awld"
-#    ) | run_on_nodes $cluster $filter
+    (declare -f install_package_on_node
+     echo "install_package_on_node $object $PACKAGES_ROOT | systemd-cat -t awld"
+    ) | run_on_nodes $cluster $filter
 }
 
 
@@ -2687,10 +2725,11 @@ SSH_KEY=
 # awld.
 SECURITY_GROUP=
 
-# Set LOGDEVICE_ROOT_DIR to the full path to the LogDevice source tree. 
-# 'awld package create' command will be looking for _build/Debug and
-# _build/Release directories relative to this path. Leave this blank if
-# you are not planning to create awld LogDevice packages.
+# Set LOGDEVICE_ROOT_DIR to the full path of LogDevice source tree on
+# this machine. 'awld package create' command will be looking for 
+# _build/Debug and _build/Release subdirectories relative to this path. 
+# Leave blank if you are not planning to create and deploy awld LogDevice 
+# packages.
 LOGDEVICE_ROOT_DIR=
 
 EOF

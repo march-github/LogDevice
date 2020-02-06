@@ -77,7 +77,8 @@ PORT_CLIENT=16001 \
 PORT_GOSSIP=16002 \
 PORT_SSL= \
 PORT_ADMIN=16004 \
-PORT_COMMAND=16005
+PORT_COMMAND=16005 \
+PORT_PROMETHEUS=16006	
 
 declare -r NODES_MAX=512   # maximum number of nodes in a LogDevice cluster
 declare -r DATADIR="/data" # directory where NSHARDS and shard mount points are
@@ -403,7 +404,7 @@ run_on_instance() {
     local iid=$1 ; shift
     local cmd="$*"
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -n -T $SSHOPTS ec2-user@$(aws ec2 describe-instances \
+	    ssh -qnT $SSHOPTS ec2-user@$(aws ec2 describe-instances \
 		       --instance-ids $iid \
 		       --query 'Reservations[].Instances[].PublicDnsName'\
 		       --output text) \
@@ -456,8 +457,8 @@ forward_ports_to() {
    done
 
    if [[ -n $fwd ]]; then
-       ssh -Nf4 -oStrictHostKeyChecking=no \
-	        -oExitOnForwardFailure=yes $fwd ubuntu@$h
+       ssh -qNf4 -oStrictHostKeyChecking=no \
+	         -oExitOnForwardFailure=yes $fwd ubuntu@$h
    fi 
 }
 
@@ -498,8 +499,8 @@ wait_up() {
 # a LogDevice node. This script is what logdeviced.service systemd unit
 # executes.
 logdevicedctl() {
-    local substitute='$LOGDEVICECONFIG_LOC $PORT_CLIENT 
-                      $PORT_COMMAND $DATADIR $PACKAGES_ROOT'
+    local substitute='$LOGDEVICECONFIG_LOC $DATADIR $PACKAGES_ROOT
+                      $PORT_CLIENT $PORT_COMMAND $PORT_PROMETHEUS'
     local v
     
     for v in $(envsubst -v "$substitute"); do export $v; done
@@ -521,20 +522,31 @@ case "${1-}" in
        exit 1       
      fi
      ulimit -Sc unlimited
-     LOGDEVICED=$PACKAGES_ROOT/current/bin/logdeviced
-     if [[ ! -h $PACKAGES_ROOT/current ]]; then
-       >&2 echo "ERROR: $PACKAGES_ROOT/current does not exist or not a symlink"
+     CURRENT_PACKAGE=$PACKAGES_ROOT/current
+     if [[ ! -h $CURRENT_PACKAGE ]]; then
+       >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
        exit 1
      fi
-     if [[ ! -x $LOGDEVICED ]]; then
-       >&2 echo "ERROR: $(readlink -m $LOGDEVICED) not found or not executable"
+     cd $CURRENT_PACKAGE 2>/dev/null
+     if [[ $? -ne 0 ]]; then
+       >&2 echo "ERROR: failed to cd to current package directory"\
+                $(readlink -m $CURRENT_PACKAGE)
        exit 1
      fi
-     $LOGDEVICED --config-path  $(cat $LOGDEVICECONFIG_LOC) \
-                 --port $PORT_CLIENT \
-                 --command-port $PORT_COMMAND \
-                 --local-log-store-path=$DATADIR/ &
+     if [[ ! -x bin/logdeviced ]]; then
+       >&2 echo "ERROR: $CURRENT_PACKAGE/bin/logdeviced not found"\
+                "or not executable"
+       exit 1
+     fi
+
+     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced\
+          --config-path  $(cat $LOGDEVICECONFIG_LOC) \
+          --port $PORT_CLIENT \
+          --command-port $PORT_COMMAND \
+          --prometheus-listen-addr 0.0.0.0:$PORT_PROMETHEUS \
+          --local-log-store-path=$DATADIR/ &
      logdeviced_pid=$!
+
      echo $logdeviced_pid > /run/logdeviced.pid
      while [[ $(date +%s) -le $deadline ]]; do
        running=$(echo info | nc -N -w 10 localhost $PORT_COMMAND | grep '^PID')
@@ -709,7 +721,7 @@ EOF
 }
 
 
-# Output a Prometheus config file for use one the admin EC2 instance
+# Output a Prometheus config file for use on the admin EC2 instance
 # of an awld deployment.
 prometheus_config() {
     cat <<'EOF'
@@ -994,7 +1006,7 @@ get_nshards() {
     local hostname=$1
      
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -n -T $SSHOPTS ubuntu@$hostname cat $DATADIR/NSHARDS
+	    ssh -qnT $SSHOPTS ubuntu@$hostname cat $DATADIR/NSHARDS
 }
  
 
@@ -1198,7 +1210,7 @@ zkcli() {
     local zkhost="$1"
     
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -T $SSHOPTS ec2-user@$zkhost \
+	    ssh -qT $SSHOPTS ec2-user@$zkhost \
 	/opt/zookeeper/bin/zkCli.sh -server localhost:$ZKCLTPORT
 }
 
@@ -1510,7 +1522,7 @@ run_on_nodes() {
     for logfile in $(ls $log_file_prefix-*.log); do
 	local hostname=$(head -n 1 $logfile | cut -d ' ' -f 3)
 	(echo "$script" | timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-				  ssh -T $SSHOPTS ubuntu@$hostname bash 2>&1
+				  ssh -qT $SSHOPTS ubuntu@$hostname bash 2>&1
 	 case $? in
 	     0) ;; # remote script is expected to supply status on success
 	     124) echo "...timedout";;
@@ -2031,7 +2043,7 @@ EOF
 	echo "Copying dynamic Zookeeper config to $iid ($hostname)"
 
 	echo "$zkdyncfg" | timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-				   ssh -T $SSHOPTS ec2-user@$hostname bash -c \
+				   ssh -qT $SSHOPTS ec2-user@$hostname bash -c \
 	  "cat > ${ZOOCFG}.dynamic && echo $myid > $ZKDATADIR/myid"
 	if [[ $? -ne 0 ]]; then
 	    exit_error "Failed to copy dynamic Zookeeper configuration to "\
@@ -2046,7 +2058,7 @@ EOF
 	echo "($hostname)"
 	trap "rm -f /tmp/start-zk-$iid" EXIT
 	timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	     ssh -n -T $SSHOPTS ec2-user@$hostname "\
+	     ssh -qnT $SSHOPTS ec2-user@$hostname "\
 		/opt/zookeeper/bin/zkServer.sh stop \
 		&& sleep 2 \
 		&& /opt/zookeeper/bin/zkServer.sh start" \

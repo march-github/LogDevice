@@ -96,8 +96,10 @@ declare -r LOGDEVICEDCTL="/usr/local/bin/logdevicedctl"
 # in the zk://<ip:port...>/<path> format
 declare -r LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
 
-declare -r SSH_TIMEOUT="2m" # timeout(1) for remote commands over ssh
-declare -r SSH_KILL_AFTER="3m"  # SIGKILL ssh after this much time
+SSH_TIMEOUT="2m"   # timeout(1) for remote commands over ssh. Not read-only so
+                   # that local variables can override.
+declare -r SSH_KILL_AFTER="1m"  # SIGKILL ssh if still running after timeout
+                                # plus this much time
 
 # Root directory for the tree of awld packages on cluster nodes.
 declare -r PACKAGES_ROOT="/opt/awld/packages"
@@ -709,6 +711,7 @@ EOF
     echo "EOF"
     echo "chmod a+x $LOGDEVICEDCTL"
     echo "mkdir -p $PACKAGES_ROOT && chown ubuntu:ubuntu $PACKAGES_ROOT"
+    echo "ldconfig /usr/local/lib"
     if [[ $storage_type != "none" ]]; then
 	echo
 	shard_init_script
@@ -989,7 +992,7 @@ EOF
 	--filter "$running_instances" \
 	--query "$awsquery" \
 	--output text | \
-   awk "$format_results" | LC_ALL=C sort -k 1,1 -k 4,4 -k 2,2n
+    awk "$format_results" | LC_ALL=C sort -k 1,1 -k 4,4 -k 2,2n
 }
 
 
@@ -1463,7 +1466,7 @@ EOF
 # a status string. If the remote execution was reported successful by ssh,
 # the status string is the last line output by the remote script, or
 # "success" if the script output nothing. If a failure code is returned,
-# or if ssh was unable to connect, or out timed out after $SSH_TIMEOUT,
+# or if ssh was unable to connect, or if it timed out after $SSH_TIMEOUT,
 # the status string is "failed:", "ssh error:", or "timed out:" respectively,
 # followed by the last line output by the script to stderr or stdout (if any).
 #
@@ -1473,15 +1476,15 @@ EOF
 #                    If given, the operation will only be run on those
 #                    racks/instances.
 run_on_nodes() {
-    local cluster=$1 ; shift
-    local regex=  # grep the output of list() against this
-    local bar=
-    local script="$(cat)"  # bash script to execute remotely
+    declare -r cluster=$1 ; shift
+    local filter= # regex on list() output corresponding to $2..$#
+    local bar=    # '|' separating components of $filter (if any)
+    declare -r script="$(cat)"  # bash script to execute remotely
     
     for f in $@; do
 	case $f in
-	    ????????-????????) regex="${regex}${bar}\\.${f} " ;;
-	    i-?*) regex="${regex}${bar}${f} " ;;
+	    ????????-????????) filter="${filter}${bar}\\.${f} " ;;
+	    i-?*) filter="${filter}${bar}${f} " ;;
 	esac
 	bar='|'
     done
@@ -1489,17 +1492,28 @@ run_on_nodes() {
     # the following escapes [ and ] in $cluster
     local cluster_re=${cluster/\[/\\[}
     cluster_re=${cluster_re/]/\\]}
+        
+    local nodes  # iids, locations, and dns names of nodes after filtering
+    nodes=$(list)
 
-    regex="^$cluster_re .*($regex)"
-    
-    # iids, locations, and dns names of nodes after filtering
-    local nodes=$(list | grep -E "$regex")
-
-    if [[ -z "$nodes" ]]; then
-	echo "No nodes in cluster '$cluster' match the specified filter"
-	return 1
+    if [[ $? -ne 0 ]]; then
+	exit_error "failed to list AWS instances running LogDevice nodes"
     fi
 
+    nodes=$(echo "$nodes" | grep -E "^$cluster_re ")
+    
+    if [[ -z $nodes ]]; then
+	exit_error "cluster '$cluster' was not found."
+    fi
+
+    if [[ -n $filter ]]; then
+	nodes=$(echo "$nodes" | grep -E "^$cluster_re .*($filter)")
+	if [[ -z $nodes ]]; then
+	    echo "No nodes in cluster '$cluster' match the specified filter"
+	    return 1
+	fi
+    fi
+    
     local log_file_prefix="/tmp/awld-$$"
     rm -f $log_file_prefix-*
     trap "rm -f $log_file_prefix-*" EXIT
@@ -2506,11 +2520,11 @@ EOF
 install_package_on_node() {
     declare -r object=$1
     declare -r packages_root=$2
+    shift ; shift
+
     local name          # package name component without version
     local version       # package version component
 
-    shift ; shift
-    
     if [[ $object =~ s3://packages\.awld\.[^/]+/([^ /]+)/([^ /]+)$ ]]; then
 	name=${BASH_REMATCH[1]}
 	version=${BASH_REMATCH[2]}
@@ -2601,7 +2615,7 @@ EOF
     bucket=$(packages_bucket) || exit
     local object="$bucket/$package"
         
-    local available
+    local available    # keys of all packages in bucket
     available=$(aws s3 ls --recursive $bucket | awk '{print $4}')
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to list contents of package bucket $bucket"
@@ -2611,11 +2625,12 @@ EOF
     for p in $available; do
 	if [[ $p == $package ]]; then
 	    # $package exists in $bucket, install it
+	    local SSH_TIMEOUT="5m"   # use a longer ssh timeout in run_on_nodes()
 	    (declare -f install_package_on_node
-	     echo "install_package_on_node $object $PACKAGES_ROOT $available"\
-		  "| systemd-cat -t awld"
+	     echo "install_package_on_node $object $PACKAGES_ROOT " $available \
+	          "| systemd-cat -t awld"
 	    ) | run_on_nodes $cluster $filter
-	    exit
+	    return
         fi
     done
 

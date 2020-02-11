@@ -99,14 +99,8 @@ declare -r LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
 declare -r SSH_TIMEOUT="2m" # timeout(1) for remote commands over ssh
 declare -r SSH_KILL_AFTER="3m"  # SIGKILL ssh after this much time
 
-# The names of labelled packages start with this prefix.
-declare -r RELEASE_PREFIX="logdevice-"
-
-# The names of anonymous build packages start with this prefix.
-declare -r BUILD_PREFIX="build-"
-
-# Root directory for the tree of LogDevice packages on cluster nodes.
-declare -r PACKAGES_ROOT="/opt/logdevice"
+# Root directory for the tree of awld packages on cluster nodes.
+declare -r PACKAGES_ROOT="/opt/awld/packages"
 
 # timeout(1) for aws s3 operations while uploading and downloading packages
 declare -r PACKAGE_S3_TIMEOUT="5m"   # send SIGINT after this time elapses
@@ -522,7 +516,7 @@ case "${1-}" in
        exit 1       
      fi
      ulimit -Sc unlimited
-     CURRENT_PACKAGE=$PACKAGES_ROOT/current
+     CURRENT_PACKAGE=$PACKAGES_ROOT/logdevice/current
      if [[ ! -h $CURRENT_PACKAGE ]]; then
        >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
        exit 1
@@ -714,6 +708,7 @@ EOF
     logdevicedctl
     echo "EOF"
     echo "chmod a+x $LOGDEVICEDCTL"
+    echo "mkdir -p $PACKAGES_ROOT && chown ubuntu:ubuntu $PACKAGES_ROOT"
     if [[ $storage_type != "none" ]]; then
 	echo
 	shard_init_script
@@ -2337,85 +2332,94 @@ EOF
     fi
 }
 
- 
-# Output the full URL of S3 object for a package specified by the flags passed
-# to the 'create' or 'install' subcommands of 'awld package' command.
+
+# Check that the <package-name> argument of package-create subcommand has
+# the correct charset, expand @, output an expanded package name.
 #
-# @param $1  version    version label. If empty, an anonymous "build-$TS"
-#                       package name will be created. TS is the current time.
-# @param $2  dbg        empty for packages containing optimized code, a debug
-#                       suffix (currently only "-dbg" is supported) if a debug
-#                       mode (unoptimized) package is requested
-s3_package_url() {
-    local version=$1
-    local dbg=${2-}
-    local name= # package name
-    local bucket
-    
-    bucket=$(packages_bucket)
+# @param  $1  package   the [<package-name>/]<version> argument as passed to
+#                       package-create
+#
+# @return 0 on success, 1 if $1 is invalid (exit_error called).
+package_name() {
+    declare -r package=$1
+    declare -r version=$(basename $package)
+    declare -r version_char0="a-zA-Z0-9_@"  # chars that $version can start with
+    declare -r version_charset="${version_char0}.-" # valid subsequent chars
 
-    if [[ $? -ne 0 ]]; then
-	exit_error "Failed to get the name of S3 bucket for packages."
-    elif [[ -z $bucket ]]; then
-	2> echo "ABORT: got an empty name for an S3 bucket for packages."
-	exit 1
-    fi
+    local name=$(dirname $package)    
+    case "$name" in
+	logdevice) ;;
+	.) name="logdevice" ;;
+	*) exit_error "invalid package name '$name'. Only package 'logdevice'"\
+		      " is currently supported." ;;
+    esac
     
-    if [[ -n $version ]]; then
-	if [[ ! $version =~ ^[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$ ]];
-	then
-	    exit_error "invalid --version value: '$version'."\
- 		       "Expected major.minor.patch"
-	fi
- 	name="$RELEASE_PREFIX$version$dbg"
+    case "$version" in
+	[$version_char0]*([$version_charset])) ;;
+        [.-]*) exit_error "invalid package version '$version'."\
+                   "A package version may not start with a dash or a dot." ;;
+	*) exit_error "invalid package version '$version'. A package version"\
+	     "may only contain the following characters: $version_charset" ;;
+    esac
+
+    if [[ $version =~ @ ]]; then
+       local timestamp  
+       timestamp=$(TZ='America/Los_Angeles' date +'%F_%T' | tr : .)
+       if [[ $? -ne 0 || -z $timestamp ]]; then
+	   2> echo "ABORT: Failed to generate a timestamp to expand $version."
+	   exit 1
+       fi
+       echo $name/${version//@/$timestamp}
     else
-	local timestamp
-	timestamp=$(TZ='America/Los_Angeles' date +'%F_%T')
-	if [[ $? -ne 0 || -z $timestamp ]]; then
-	    2> echo "ABORT: Failed to generate a timestamp"
-	    exit 1
-	fi
-	name="$BUILD_PREFIX$timestamp$dbg"
+       echo $name/$version
     fi
-
-    echo "$bucket/$name"
 }
- 
+
 
 package-create() {
     [[ ${1-} == help ]] && cat <<EOF && return
-    create  :  create a new package and upload it to an S3 object in bucket
-               s3://packages.awld.<AWS_REGION>.<user-id> where AWS_REGION is
-               set in the awld config file $CFGPATH. 
-               AWS user running awld must have write access to the bucket.
+    create  [<package>/]<version>
+           create a new package and upload it to S3 as an object in bucket
+           s3://packages.awld.<AWS_REGION>.<user-id> where AWS_REGION is
+           from the awld config file $CFGPATH. 
+           AWS user running awld must have write access to the bucket. 
 
-               The binary files to be packaged are copied from a build
-               directory \$LOGDEVICE_ROOT_DIR/_build/\$MODE where
-               LOGDEVICE_ROOT_DIR must be set in the awld config file, and
-               \$MODE is either Debug or Release, depending on the presence
-               of --debug flag.
+	   At the moment the only <package-name> supported is "logdevice".
+	   This is also the default name assummed, if omited.
 
-               Unless --version is specified, an anonymous "latest"
-               package is created and stored in S3 object named
-               build-\$DATE_\$TIME[-dbg]. -dbg suffix indicates a
-               debug build package and is only present if --debug is passed.
-               \$DATE and \$TIME are current date and time in PST time zone.
+           <version> may only contain characters A-Za-z0-9._@- and
+           must not start with a dash (-). All occurrences of @ in <version>
+           will be replaced with the current DATE_TIME timestamp in the 
+           US/Pacific time zone. This allows for quickly creating and deploying 
+           test builds.
+
+           The binary files to be packaged are copied from build
+           directory \$LOGDEVICE_ROOT_DIR/_build/\$MODE where
+           LOGDEVICE_ROOT_DIR is from the awld config file, and
+           \$MODE is the string "Debug" if <package-name> ends with "-dbg",
+           indicating an unoptimized build with full debug info, Otherwise 
+           the string "Release", expecting an optimized build.
 EOF
-    local dbg=  # suffix to add to package name
-    local mode=Release # subdirectory of $LOGDEVICE_ROOT_DIR/_build to use
-    local version=
-    local name= # package name
-    local contents="bin/logdeviced lib/libldprometheus.so" # files to package
-    
-    while [[ $# -gt 0 ]]; do
-	case "$1" in
-	    -g|--debug) dbg="-dbg" ; mode="Debug" ; shift ;;
-            -v|--version) readopt version "$@"    ; shift ; shift ;;
- 	    -*|--*=) exit_error "unknown value $1" ;;
-	    *) exit_error "unexpected parameter '$1'" ;;
-	esac
-    done    
-    
+    local mode # subdirectory of $LOGDEVICE_ROOT_DIR/_build to use
+    local package # package name
+    declare -r logdevice_contents="bin/logdeviced lib/libldprometheus.so"
+                                                          # files to package
+                                                        
+    if [[ $# -lt 1 ]]; then
+	exit_error "missing package name."
+    fi
+
+    package=$(package_name $1) || exit
+
+    if [[ $# -gt 1 ]]; then
+       exit_error "unexpected parameter: $2"
+    fi
+       
+    case $package in
+	*-dbg) mode=Debug ;;
+	*)     mode=Release ;;
+    esac
+       
     if [[ -z ${LOGDEVICE_ROOT_DIR-} ]]; then
 	exit_error "LOGDEVICE_ROOT_DIR is not set in $CFGPATH."\
                    "\nSet it to the path of the LogDevice distribution"\
@@ -2431,11 +2435,13 @@ EOF
 
     cd $LOGDEVICE_ROOT_DIR/_build/$mode || \
 	exit_error "Directory $LOGDEVICE_ROOT_DIR/_build/$mode does not exist"\
-		   "or is not accessible. Build LogDevice fist passing"\
-		   "-DCMAKE_BUILD_TYPE=$mode to cmake."
+		   "or is not accessible. Build LogDevice first with cmake"\
+		   "-DCMAKE_BUILD_TYPE=$mode"
 
+    declare -r files=$logdevice_contents # only logdevice package is supported
+                                         # currently    
     local c
-    for c in $contents; do
+    for c in $files; do
 	if [[ ! -r $c ]]; then
 	    exit_error "File $LOGDEVICE_ROOT_DIR/_build/$mode/$c"\
 		       "\ndoes not exist or is not readable. Build LogDevice"\
@@ -2446,20 +2452,23 @@ EOF
 	fi
     done    
 
-    local object
-    object=$(s3_package_url "$version" $dbg) || exit
+    local bucket
+    bucket=$(packages_bucket) || exit
+    local object="$bucket/$package"
     
-    echo "Building package $(basename $object)"
+    echo "Building a $mode package $package"
     echo "and uploading it to $object"
-
-    local upload="aws s3 cp - $object" # upload command
     
+    local upload="aws s3 cp - $object" # upload command
+
+    # start a monitor that will print a . to stdout every 10s while
+    # upload is in progress
     (while :; do
        sleep 10
        if pgrep -P $$ -f "$upload" >/dev/null; then echo -n "."; else exit 0; fi
      done) &
     
-    tar -cz $contents | timeout $PACKAGE_S3_TIMEOUT $upload
+    tar -cz $files | timeout $PACKAGE_S3_TIMEOUT $upload
 
     local upload_status=$?
 
@@ -2477,34 +2486,46 @@ EOF
 
 
 # This function is intended to be run on a LogDevice cluster node via
-# run_on_nodes() in order to install an awld package on that node. Its
-# stdout is expected to be piped to a local logger, e.g., via systemd-cat.
+# run_on_nodes() in order to install a specific version of an awld package
+# on that node. Its stdout is expected to be piped to a local logger, e.g.,
+# via systemd-cat.
 #
-# If the package is already present on the node, do not pull it again.
+# If the package version is already present on the node, do not pull it again.
 # Otherwise copy the tar.gz package from $object and unpack it into
-# $PACKAGES_ROOT/<package-name>. Once the specified package has
+# $PACKAGES_ROOT/<object-key>. Once the specified package version has
 # been successfully pulled from S3 (or found to be present), set the
-# $PACKAGES_ROOT/current symlink to point to the root directory of the package.
+# $PACKAGES_ROOT/$(dirname object-key)/current  symlink to point to the
+# root directory of the package.
 #
-# @param $1  object  an S3 URL of the object containing the package to install
+# @param $1  object         an S3 URL of the object containing the package to
+#                           install
 # @param $2  packages_root  the value of $PACKAGES_ROOT
+# @param $3..$#             a list of all package/version keys in the
+#                           packages bucket
 #
 install_package_on_node() {
     declare -r object=$1
     declare -r packages_root=$2
-    declare -r name=$(basename $object)  # name of package   
+    local name          # package name component without version
+    local version       # package version component
+
+    shift ; shift
+    
+    if [[ $object =~ s3://packages\.awld\.[^/]+/([^ /]+)/([^ /]+)$ ]]; then
+	name=${BASH_REMATCH[1]}
+	version=${BASH_REMATCH[2]}
+    else
+	>&2 echo "ABORT: invalid S3 URL '$object' passed to $FUNCNAME"
+	exit 1
+    fi	
     
     # Path to current logdevice package on nodes. This is a symlink to the
     # current package directory, e.g.
-    # /opt/logdevice/current -> /opt/logdevice/logdevice-2.26.5
-    declare -r current_symlink=$packages_root/current
+    # $PACKAGES_ROOT/logdevice/current ->
+    #                             $PACKAGES_ROOT/logdevice/logdevice-2.26.5
+    declare -r current_symlink=$packages_root/$name/current
 
     echo "installing $object"
-
-    if [[ ${object:0:19} != "s3://packages.awld." ]]; then
-	>&2 echo "ABORT: invalid S3 URL '$object' passed to $FUNCNAME"
-	exit 1
-    fi
     
     if [[ ! ( -d $packages_root && -w $packages_root ) ]]; then
 	>&2 echo "Packages directory $packages_root does not exist or "\
@@ -2512,9 +2533,9 @@ install_package_on_node() {
 	exit 1
     fi
     
-    cd $packages_root || exit
+    cd $packages_root && mkdir -p $name && cd $name || exit
    
-    if [[ -a $name ]]; then
+    if [[ -a $version ]]; then
 	echo "package directory exists"
     else
 	echo "downloading package from S3"
@@ -2528,109 +2549,104 @@ install_package_on_node() {
 	fi	
 	aws s3 cp --only-show-errors $object $tgz       &&\
 	gzip -t $tgz                                    &&\
-	mkdir $name                                     &&\
-	tar --force-local -C $name -xzf $tgz            || exit
+	mkdir $version                                  &&\
+	tar --force-local -C $version -xzf $tgz         || exit
 	rm -f $tgz
     fi
 
-    echo "setting $packages_root/current -> $name"
+    echo "setting $name/current -> $version"
     
-    ln -sfn $name current || exit	
+    ln -sfn $version current || exit
+
+    #TODO: delete all version directories in $packages_root that
+    # do not appear in $@
 }
 
 
 package-install() {
     [[ ${1-} == help ]] && cat <<EOF && return
-    install  : install one of the packages stored in s3://packages.awld*/
-               bucket to the specified set of nodes in a logdevice cluster.
-               The intallation process consists of copying the package onto
-               the specified nodes (if not already there), adjusting the 
-               current package symlinks, then performing a rolling restart 
-               of the affected nodes. 
-
-               With --version v the command will attempt to install the package
-               named ${RELEASE_PREFIX}<v>[-dbg]. The -dbg suffix will be added 
-               if --debug is also present.
-
-               Without --version the operation will install the latest package
-               matching the ${BUILD_PREFIX}<TS>[-dbg] pattern. <TS> is the 
-               creation timestamp. "-dbg" is added if --debug option is passed. 
-               A matching package with the highest timestamp will be selected.
+    install [<package>/]<version> -c <cluster> [<instance and rack ids>]
+           install a particular version of one of the packages stored in 
+           s3://packages.awld*/ bucket to the specified set of LogDevice
+           nodes.
+           The installation process consists of copying the package onto
+           the specified nodes (if not already there) and adjusting the 
+           current package symlink. No rolling restart is performed.
+           <package>/<version> identifies the package version to install, 
+           as reported by 'package list'. If <package>/ is omitted,
+           "logdevice/" is assumed.
 EOF
 
-    local version=
-    local dbg=  # suffix to add to package name
-    local args=
-    local cluster=
-    local filter=  # rack and instance ids from command line
+    if [[ $# -lt 1 ]]; then
+	exit_error "missing package name. See help."
+    fi
 
-    while [[ $# -gt 0 ]]; do
-	case "$1" in
-	    -g|--debug) dbg="-dbg" ; shift ;;
-            -v|--version) readopt version "$@" ; shift ; shift ;;
-	    *) args="$args $1" ; shift ;;
-	esac
-    done
-    
-    parse_cluster_filter cluster filter $args
+    case "$1" in
+	-*) exit_error "expected a package name. Got '$1'." ;;
+	*@*) exit_error "'@' cannot appear in the name of package to install.";;
+    esac
+
+    local package
+    package=$(package_name $1) || exit
+    shift
+
+    local cluster=
+    local filter=    
+
+    parse_cluster_filter cluster filter "$@"
 
     validate_cluster_name $cluster
-    
-    local object # provisional, may be adjusted
-    object=$(s3_package_url "$version" $dbg) || exit
-    
-    declare -r bucket=$(dirname $object)
-    local package # package name
 
-    if [[ -z $bucket ]]; then
-	>&2 echo "ABORT: empty value of \$bucket in $FUNCNAME. "\
-	    "Expected s3://..."
-	exit 1
-    fi    
-    
-    local package_list
-    package_list="$(aws s3 ls $bucket)"   
+    local bucket
+    bucket=$(packages_bucket) || exit
+    local object="$bucket/$package"
+        
+    local available
+    available=$(aws s3 ls --recursive $bucket | awk '{print $4}')
     if [[ $? -ne 0 ]]; then
 	exit_error "Failed to list contents of package bucket $bucket"
     fi
 
-    if [[ -z $version ]]; then
-	# install most recent build-* or build-*-dbg package
-        declare -r pattern="^$BUILD_PREFIX[0-9:_-]+$dbg\$"
-	package=$(echo "$package_list" |\
-		          awk "{if (\$4 ~ /$pattern/) m=\$4} END{print m}")
-	if [[ -z $package ]]; then
-	    if [[ -z $dbg ]]; then
-		exit_error "no optimized builds available"
-	    else
-		exit_error "no debug builds available"
-	    fi
-	fi
-	object="$bucket/$package"
-    else
-	package=$(basename $object)
-	if ! echo "$package_list" | awk -v n="$package"\
-				     '{if ($4==n) m=1} END{exit m?0:1}'; then
-	    exit_error "unknown package: $package"
-	fi
-    fi
-    
-    (declare -f install_package_on_node
-     echo "install_package_on_node $object $PACKAGES_ROOT | systemd-cat -t awld"
-    ) | run_on_nodes $cluster $filter
+    local p
+    for p in $available; do
+	if [[ $p == $package ]]; then
+	    # $package exists in $bucket, install it
+	    (declare -f install_package_on_node
+	     echo "install_package_on_node $object $PACKAGES_ROOT $available"\
+		  "| systemd-cat -t awld"
+	    ) | run_on_nodes $cluster $filter
+	    exit
+        fi
+    done
+
+    # we get here only if $package was not in $available
+    exit_error "unknown package: $package"    
 }
 
 
 package-list() {
     [[ ${1-} == help ]] && cat <<EOF && return
-    list    :  without flags lists all packages currently stored in the
-               awld packages S3 bucket and available for deployment.
-               With --cluster and optional rack and instance id list in the
-               format of start/stop/status commands lists the current package 
-               version on each of the specified nodes in the cluster.
+    list [<package>] [--cluster <cluster> [filters]]
+           without flags lists all versions of <package> currently 
+           stored in s3://packages.awld* S3 bucket and available for 
+           deployment.
+           With --cluster and optional rack and instance id list
+           (see package install) lists the current version of <package>
+           on each of the specified nodes in the cluster.
+           The default (and the only currently supported) package name 
+           is "logdevice".
 EOF
     local cluster=
     local filter=  # rack and instance ids from command line
+    local package=logdevice # name of package whose versions to list
+
+    if [[ $# -gt 0 ]]; then
+	case $1 in
+	    -*) ;;        # it's an option, likely --cluster|-c
+	    */) package=${1: 0: -1} ; shift ;;  # be nice, remove trailing /
+	    *) package=$1 ; shift ;;
+	esac
+    fi       
 
     parse_cluster_filter cluster filter "$@"
 
@@ -2641,11 +2657,11 @@ EOF
 	local bucket
 	bucket=$(packages_bucket) || exit
 
-	aws s3 ls $bucket
+	aws s3 ls $bucket/$package/
     else
 	validate_cluster_name $cluster
-	echo "ls -l $PACKAGES_ROOT/current | grep -o 'current ->.*\$'"\
-	    | run_on_nodes $cluster $filter
+	echo "ls -l $PACKAGES_ROOT/$package/current |"\
+	     "grep -o '$package/current ->.*\$'" | run_on_nodes $cluster $filter
     fi    
 }
 
@@ -2665,23 +2681,14 @@ $(package-install help)
 $(package-list help)
 
     FLAGS
-       -g|--debug        If present, add "-dbg" suffix to the
-                         name of the package being created or installed.
-                         Look for binaries in _build/Debug subdirectory of
-                         \$LOGDEVICE_ROOT_DIR.
-                                       
-       -v|--version <maj.min.patch>    Create or install a "release" package 
-                                       $RELEASE_PREFIX<maj.min.patch>[-dbg].
+     -c|--cluster <name>   Required for 'install' subcommand, optional for
+                           'list'. Name of cluster on which to operate.
 
-       -c|--cluster <name>   Required for 'install' subcommand, optional for
-                             'list'. Name of cluster on which to operate.
-
-     [{<rack-id>|<instance-id>}...] Can only be specified following the
-                                    --cluster flag. Any number of rack and 
-                                    instance ids may be given. If any ids are 
-                                    given, the operation will be attempted on 
-                                    the specified instances/racks only. 
-				    Otherwise it will run on the whole cluster.
+     [{<rack-id>|<instance-id>}...] Optional. If present, must follow
+                                    --cluster <name>. Any number of rack and 
+                                    instance ids may be given. The operation 
+                                    will be attempted on the specified 
+                                    instances/racks only.
 EOF
 
     local subcmd=${1-}

@@ -216,6 +216,15 @@ tracelog() {
 }
 
 
+# Export all variables listed in $1 in the format expected by envsubst(1),
+# then call envsubst for them.
+varsubst() {
+    local v
+    for v in $(envsubst -v "$1"); do export $v; done
+    envsubst "$1"
+}
+
+
 # Output the numeric id of AWS account configured for use by awscli
 # in the environment of awld process or in ~/.aws/credentials. This is
 # the account that awld "runs as". On failure, log an error to stderr and
@@ -437,14 +446,8 @@ forward_ports_to() {
 		"Expected a port number, got $p" ; exit 1 ;;
         esac
         # check if ssh forwarding is already set up for local port $p
-        if ps auxwww | awk -v port=$p -v host=$h\
-	 '{ if ($11=="ssh") 
-              for (i=12; i<NF; i++) {
-                 if ($i=="-L" && $(i+1)==port":127.0.0.1:"port) port_seen=1 ;
-                 if ($i=="ubuntu@"host) host_seen=1
-              }
-          } END{ exit port_seen && host_seen ? 0 : 1 }';
-	then
+        if pgrep -f "^ssh .*-L ?$p:127\.0\.0\.1:$p .*ubuntu@${h//./\\.}\$"\
+		 2>/dev/null; then
 	    echo "Local port $p is forwarded to $h"
 	else
 	    echo "Forwarding local port $p to $h"
@@ -495,12 +498,8 @@ wait_up() {
 # a LogDevice node. This script is what logdeviced.service systemd unit
 # executes.
 logdevicedctl() {
-    local substitute='$LOGDEVICECONFIG_LOC $DATADIR $PACKAGES_ROOT
-                      $PORT_CLIENT $PORT_COMMAND $PORT_PROMETHEUS'
-    local v
-    
-    for v in $(envsubst -v "$substitute"); do export $v; done
-    envsubst "$substitute" <<"EOF"
+    varsubst '$LOGDEVICECONFIG_LOC $DATADIR $PACKAGES_ROOT
+              $PORT_CLIENT $PORT_COMMAND $PORT_PROMETHEUS' <<"EOF"
 #!/bin/bash
 set -uo pipefail
 
@@ -619,13 +618,9 @@ EOF
 # $DATADIR/NSHARDS.
 #
 shard_init_script() {
-    local substitute='$DATADIR'
-    local v
-    
-    for v in $(envsubst -v "$substitute"); do export $v; done
     # variables in the following heredoc are NOT substituted (because "EOF")
-    # except for $DATADIR, which is expanded by envsubst
-    envsubst "$substitute" <<"EOF"
+    # except for $DATADIR, which is expanded by varsubst
+    varsubst '$DATADIR' <<"EOF"
 DEVICES=$(lsblk | awk '/^nvme/{print $1}' | sort -n)
 
 if [[ $? -ne 0 ]]; then
@@ -722,7 +717,7 @@ EOF
 # Output a Prometheus config file for use on the admin EC2 instance
 # of an awld deployment.
 prometheus_config() {
-    cat <<'EOF'
+    varsubst '$PORT_PROMETHEUS' <<'EOF'
 global:
   scrape_interval:     15s # By default, scrape targets every 15 seconds.
   evaluation_interval: 15s # By default, scrape targets every 15 seconds.
@@ -762,6 +757,19 @@ scrape_configs:
         action: keep
       - source_labels: [__meta_ec2_instance_id]
         target_label: instance
+ 
+  - job_name: logdevice
+    # scrape logdeviced instances
+    ec2_sd_configs:
+      - region: us-east-1
+        port: $PORT_PROMETHEUS
+
+    relabel_configs:
+      - source_labels: [__meta_ec2_tag_logdevice_cluster_name]
+        regex: ".+"
+        action: keep
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance    
 EOF
 }
 
@@ -770,14 +778,14 @@ EOF
 # newly allocated admin EC2 instance running Prometheus, Grafana, and
 # the LD admin service.
 admin_init_script() {
-    cat <<EOF
+    varsubst '$PACKAGES_ROOT' <<EOF
 #!/bin/bash
 set -uo pipefail
 
 PATH=/usr/local/bin:/usr/bin:/bin:/sbin
 touch /home/ubuntu/.hushlogin
 EOF
-    echo
+    echo "mkdir -p $PACKAGES_ROOT && chown ubuntu:ubuntu $PACKAGES_ROOT"
     echo "cat << 'EOF' > /etc/prometheus/prometheus.yml"
     prometheus_config
     echo "EOF"
@@ -2471,6 +2479,7 @@ EOF
     local object="$bucket/$package"
     
     echo "Building a $mode package $package"
+    echo "from $LOGDEVICE_ROOT_DIR/_build/$mode"
     echo "and uploading it to $object"
     
     local upload="aws s3 cp - $object" # upload command

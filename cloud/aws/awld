@@ -43,7 +43,7 @@ declare -Ar INSTANCE_TYPES=(
     [ssd]="m5ad.4xlarge r5dn.4xlarge r5d.4xlarge\
            m5dn.4xlarge m5d.4xlarge r5ad.4xlarge"
     [hdd]="h1.4xlarge d2.2xlarge"
-    [none]="t2.medium"   # used for testing awld
+    [none]="t2.medium"   # used for testing awld currently
     [zk]="a1.large"
     [admin]="t2.medium"
 )
@@ -2496,10 +2496,10 @@ EOF
 		   "package build root not found"
     fi
 
-    local files
-    files=$(echo ${PACKAGES[$name]} | cut -d ' ' -f 2-)
+    local manifest
+    manifest=$(echo ${PACKAGES[$name]} | cut -d ' ' -f 2-)
 
-    if [[ -z $files ]]; then
+    if [[ -z $manifest ]]; then
 	exit_error "invalid package specification for package '$name':"\
 		   "package contents missing"
     fi
@@ -2509,16 +2509,31 @@ EOF
 		   "or is not accessible. Build LogDevice first with cmake"\
 		   "-DCMAKE_BUILD_TYPE=$mode"
     local c
-    for c in $files; do
-	if [[ ! -r $c ]]; then
-	    exit_error "File $LOGDEVICE_ROOT_DIR/_build/$mode/$c"\
-		       "\ndoes not exist or is not readable. Build LogDevice"\
-		       "as follows:"\
+    local missing=    # list of files that were not found in build dir
+    local contents=   # files to tar (package manifest minus $missing)
+    for c in $manifest; do
+	if [[ -r $c ]]; then
+	    contents="$contents $c"
+	else
+	    missing="$missing $c"
+	fi
+    done
+    if [[ -n $missing ]]; then
+	if [[ -n $contents ]]; then
+	    (echo "WARNING: the following files were skipped because they"\
+		  "were not found in"
+	     echo $LOGDEVICE_ROOT_DIR/_build/$mode/$package_build_root ":"
+	     echo $missing) >&2
+	else
+	    exit_error "no files in the manifest of package '$name' were found"\
+		       "in build tree\n"\
+		       $LOGDEVICE_ROOT_DIR/_build/$mode/$package_build_root\
+		       "\nBuild LogDevice like this:"\
                        "\ncd $LOGDEVICE_ROOT_DIR/_build/$mode"\
 		       "\ncmake -DCMAKE_BUILD_TYPE=$mode ../../logdevice &&"\
 		       "make -j\$(nproc)"
 	fi
-    done    
+    fi    
 
     local bucket
     bucket=$(packages_bucket) || exit
@@ -2537,7 +2552,7 @@ EOF
        if pgrep -P $$ -f "$upload" >/dev/null; then echo -n "."; else exit 0; fi
      done) &
     
-    tar -cz $files | timeout $PACKAGE_S3_TIMEOUT $upload
+    tar -cz $contents | timeout $PACKAGE_S3_TIMEOUT $upload
 
     local upload_status=$?
 
@@ -2753,10 +2768,32 @@ EOF
 	if [[ -z $package ]]; then
 	    package='*'
 	fi
-	echo "ls -l $PACKAGES_ROOT/$package/current |"\
-             "grep -Eo '[[:alnum:]]+/current ->.*\$' | tr '\n' '\t'"\
+	echo "readlink -f $PACKAGES_ROOT/$package/current"\
+	     "| awk -F / '{printf \"%s/%s \",\$(NF-1),\$NF}'"\
 	    | run_on_nodes $cluster $filter
     fi    
+}
+
+
+package-delete() {
+    [[ ${1-} == help ]] && cat <<EOF && return
+    delete <package>/<version>
+           Delete the specified package from the s3://packages.awld.* bucket.
+EOF
+    local package
+
+    case ${1-} in
+	*/*) package=$(package_name $1) || exit ;;
+	"") exit_error "Missing package name. See help." ;;
+	*) exit_error "Invalid package identifier '$1'."\
+		      "Expected <package>/<version>."
+	   ;;
+    esac
+
+    local bucket
+    bucket=$(packages_bucket) || exit
+
+    aws s3 rm $bucket/$package
 }
 
 
@@ -2774,6 +2811,8 @@ $(package-install help)
 
 $(package-list help)
 
+$(package-delete help)
+
     FLAGS
      -c|--cluster <name>   Required for 'install' subcommand, optional for
                            'list'. Name of cluster on which to operate.
@@ -2785,15 +2824,16 @@ $(package-list help)
                                     instances/racks only.
 EOF
 
+    declare -r subcommands_glob="@(create|install|list|delete)"
     local subcmd=${1-}
     shift
   
     case "$subcmd" in
-	create|install|list) package-$subcmd "$@" ;;
+	$subcommands_glob) package-$subcmd "$@" ;;
 	"") exit_error "Missing subcommand. Expected one of:"\
-		       "create, install, list. See $FUNCNAME help." ;;
+		       "$subcommands_glob.\nSee $FUNCNAME help." ;;
 	*) exit_error "Invalid subcommand. Expected one of:"\
-		      "create, install, list. See $FUNCNAME help." ;;
+		      "$subcommands_glob.\nSee $FUNCNAME help." ;;
     esac
 }
  

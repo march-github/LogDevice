@@ -120,7 +120,7 @@ declare -rx AWS_DEFAULT_OUTPUT=text
 # which indicates that IIDS[zk], IIDS[admin], or IIDS[bench] respectively must
 # be initialized (and errors handled) before running the command.
 #
-declare -A COMMANDS=(
+declare -Ar COMMANDS=(
     [allocate]="create new LogDevice nodes by requesting instances from EC2"
     [allocate-zk]="create up to $ZK_ENSEMBLE_SIZE instances for the shared Zookeeper ensemble
                    require-zk"
@@ -144,6 +144,29 @@ declare -A COMMANDS=(
     [terminate-admin]="terminate EC2 instance running monitoring and config services
                        require-admin"
     [help]="print help"
+)
+
+
+# Package definitions for the 'package create' command. This is a map of
+# alphanumeric package names to lists of paths. The first path in the list
+# is a relative path to a subdirectory of $LOGDEVICE_ROOT_DIR/_build/$MODE.
+# That path must end with a slash. The remaining paths in the list are relative
+# to that subdirectory. They are the package contents. $MODE is the build mode,
+# currently either "Debug" or "Release".
+#
+# For example, if the first element is "foo", and the remaining two are
+# bin/bar and lib/bazz, then the package tarball will be built in the
+# directory $LOGDEVICE_ROOT_DIR/_build/$MODE/foo, with bin/bar and lib/bazz as
+# its sole contents.
+#
+# In the future this map should be moved to a config file.
+declare -Ar PACKAGES=(
+    [logdevice]="./                   bin/logdeviced lib/libldprometheus.so"
+
+    [folly]="folly-prefix/src/folly-build/                      libfolly.so"
+
+    [thrift]="fbthrift-prefix/src/fbthrift-build/
+              lib/libthriftcpp2.so lib/libcompiler_generators.so lib/libthriftprotocol.so lib/libprotocol.so lib/libtransport.so lib/libasync.so lib/libthrift-core.so lib/libconcurrency.so lib/libthriftfrozen2.so lib/libcompiler_generate_templates.so lib/libcompiler_base.so lib/libcompiler_lib.so lib/libmustache_lib.so lib/libcompiler_ast.so"                 
 )
 
 # an extended glob matching names of all supported commands
@@ -2367,13 +2390,15 @@ package_name() {
     declare -r version=$(basename $package)
     declare -r version_char0="a-zA-Z0-9_@"  # chars that $version can start with
     declare -r version_charset="${version_char0}.-" # valid subsequent chars
-
+    declare -r known_package_names="@($(echo "${!PACKAGES[@]}" | tr ' ' '|'))"
+                        # an extended glob matching names of supported packages
+    
     local name=$(dirname $package)    
     case "$name" in
-	logdevice) ;;
+	$known_package_names) ;;
 	.) name="logdevice" ;;
-	*) exit_error "invalid package name '$name'. Only package 'logdevice'"\
-		      " is currently supported." ;;
+	*) exit_error "invalid package name '$name'."\
+		      "Must be one of: ${!PACKAGES[@]}" ;;
     esac
     
     case "$version" in
@@ -2406,8 +2431,9 @@ package-create() {
            from the awld config file $CFGPATH. 
            AWS user running awld must have write access to the bucket. 
 
-	   At the moment the only <package-name> supported is "logdevice".
-	   This is also the default name assummed, if omited.
+	   If package name is omitted, "logdevice" is assumed.
+           The following package names are supported: 
+           ${!PACKAGES[@]}.
 
            <version> may only contain characters A-Za-z0-9._@- and
            must not start with a dash (-). All occurrences of @ in <version>
@@ -2423,9 +2449,7 @@ package-create() {
            the string "Release", expecting an optimized build.
 EOF
     local mode # subdirectory of $LOGDEVICE_ROOT_DIR/_build to use
-    local package # package name
-    declare -r logdevice_contents="bin/logdeviced lib/libldprometheus.so"
-                                                          # files to package
+    local package # "name/version"
                                                         
     if [[ $# -lt 1 ]]; then
 	exit_error "missing package name."
@@ -2455,13 +2479,35 @@ EOF
 		   "\npoints to the root of LogDevice source distribution."
     fi
 
-    cd $LOGDEVICE_ROOT_DIR/_build/$mode || \
+    declare -r name=$(dirname $package)
+    
+    if [[ ! ${PACKAGES[$name]+_} ]]; then
+	# package_name() above must ensure we don't get here
+	>&2 echo "ABORT: in $FUNCNAME: package name $name "\
+	    "is not a key of \${PACKAGES[]}"
+	exit 1
+    fi
+    
+    local package_build_root
+    package_build_root=$(echo ${PACKAGES[$name]} | cut -d ' ' -f 1)
+
+    if [[ -z $package_build_root ]]; then
+	exit_error "invalid package specification for package '$name':"\
+		   "package build root not found"
+    fi
+
+    local files
+    files=$(echo ${PACKAGES[$name]} | cut -d ' ' -f 2-)
+
+    if [[ -z $files ]]; then
+	exit_error "invalid package specification for package '$name':"\
+		   "package contents missing"
+    fi
+    
+    cd $LOGDEVICE_ROOT_DIR/_build/$mode/$package_build_root || \
 	exit_error "Directory $LOGDEVICE_ROOT_DIR/_build/$mode does not exist"\
 		   "or is not accessible. Build LogDevice first with cmake"\
 		   "-DCMAKE_BUILD_TYPE=$mode"
-
-    declare -r files=$logdevice_contents # only logdevice package is supported
-                                         # currently    
     local c
     for c in $files; do
 	if [[ ! -r $c ]]; then
@@ -2581,6 +2627,23 @@ install_package_on_node() {
     
     ln -sfn $version current || exit
 
+    # ld.so.conf include populated by awld
+    declare -r ldsoconf='/etc/ld.so.conf.d/awld.conf'
+
+    # Merge the list of paths in /etc/ld.so.conf/awld.conf with the
+    # list of paths to subdirectories of $name/current that contain
+    # shared libraries. Dedup and replace the contents of
+    # /etc/ld.so.conf/awld.conf with the result. Finally, run ldconfig
+    # to make ld.so aware of all the libraries we just installed and
+    # make it forget the libraries in previous active version of this package.
+    trap "rm -f /tmp/awld.$$.ldsoconf" EXIT
+    (cat $ldsoconf 2>/dev/null ;
+     find $PWD/current/ -name "*.so" -type f -exec dirname {} \; )\
+	| sort -u > /tmp/awld.$$.ldsoconf && \
+	cp /tmp/awld.$$.ldsoconf $ldsoconf &&\
+	rm -f /tmp/awld.$$.ldsoconf &&\
+	sudo /sbin/ldconfig
+    
     #TODO: delete all version directories in $packages_root that
     # do not appear in $@
 }
@@ -2634,7 +2697,7 @@ EOF
     for p in $available; do
 	if [[ $p == $package ]]; then
 	    # $package exists in $bucket, install it
-	    local SSH_TIMEOUT="5m"   # use a longer ssh timeout in run_on_nodes()
+	    local SSH_TIMEOUT="5m"  # use a longer ssh timeout in run_on_nodes()
 	    (declare -f install_package_on_node
 	     echo "install_package_on_node $object $PACKAGES_ROOT " $available \
 	          "| systemd-cat -t awld"
@@ -2662,12 +2725,12 @@ package-list() {
 EOF
     local cluster=
     local filter=  # rack and instance ids from command line
-    local package=logdevice # name of package whose versions to list
+    local package= # name of package whose versions to list
 
     if [[ $# -gt 0 ]]; then
 	case $1 in
 	    -*) ;;        # it's an option, likely --cluster|-c
-	    */) package=${1: 0: -1} ; shift ;;  # be nice, remove trailing /
+	    */) package=${1: 0: -1} ; shift ;;  # remove trailing /
 	    *) package=$1 ; shift ;;
 	esac
     fi       
@@ -2675,17 +2738,24 @@ EOF
     parse_cluster_filter cluster filter "$@"
 
     if [[ -z $cluster ]]; then
-	# if we get here, --cluster was not given, nor were there
-	# any rack or instance ids given. List the bucket.
+	# No cluster name specified. List the bucket.
 
 	local bucket
 	bucket=$(packages_bucket) || exit
 
-	aws s3 ls $bucket/$package/
+	if [[ -n $package ]]; then
+	    aws s3 ls $bucket/$package/
+	else
+	    aws s3 ls --recursive $bucket/
+	fi
     else
 	validate_cluster_name $cluster
+	if [[ -z $package ]]; then
+	    package='*'
+	fi
 	echo "ls -l $PACKAGES_ROOT/$package/current |"\
-	     "grep -o '$package/current ->.*\$'" | run_on_nodes $cluster $filter
+             "grep -Eo '[[:alnum:]]+/current ->.*\$' | tr '\n' '\t'"\
+	    | run_on_nodes $cluster $filter
     fi    
 }
 

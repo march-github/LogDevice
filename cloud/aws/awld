@@ -73,12 +73,14 @@ declare -A IIDS=([zk]= [admin]= [bench]=)
 
 # LogDevice server ports
 declare -r \
-PORT_CLIENT=16001 \
-PORT_GOSSIP=16002 \
-PORT_SSL= \
-PORT_ADMIN=16004 \
-PORT_COMMAND=16005 \
-PORT_PROMETHEUS=16006	
+	PORT_LD_CLIENT=16001 \
+	PORT_LD_GOSSIP=16002 \
+	PORT_LD_SSL= \
+	PORT_LD_ADMIN=16004 \
+	PORT_LD_COMMAND=16005 \
+	PORT_LD_PROMETHEUS=16006 \
+	PORT_PROMETHEUS=9090 \
+	PORT_GRAFANA=3000
 
 declare -r NODES_MAX=512   # maximum number of nodes in a LogDevice cluster
 declare -r DATADIR="/data" # directory where NSHARDS and shard mount points are
@@ -129,19 +131,19 @@ declare -Ar COMMANDS=(
     [config]="create and store, or retrieve a cluster configuration file
               require-zk"
     [list]="list running EC2 instances allocated by awld"
-    [package]="create or deploy a logdevice package, list available packages"
+    [package]="create or deploy a logdevice code package, list available packages"
     [start]="start logdeviced on one, several, or all nodes in a cluster
               require-zk"
     [start-zk]="start all Zookeeper instances previously created by allocate-zk
               require-zk"
-    [start-admin]="start administrative services like Prometheus and LD admin server
+    [start-admin]="start administrative services: Prometheus, LD admin server
               require-admin"    
     [stop]="stop logdeviced on one, several, or all nodes in a cluster"
     [stop-zk]="shut down Zookeeper service and stop all Zookeeper instances, 
               require-zk"
     [status]="check whether logdeviced is running"
     [terminate]="terminate EC2 instances and spot requests for a LogDevice cluster"
-    [terminate-admin]="terminate EC2 instance running monitoring and config services
+    [terminate-admin]="terminate EC2 instance running monitoring and admin services
                        require-admin"
     [help]="print help"
 )
@@ -470,7 +472,7 @@ forward_ports_to() {
         esac
         # check if ssh forwarding is already set up for local port $p
         if pgrep -f "^ssh .*-L ?$p:127\.0\.0\.1:$p .*ubuntu@${h//./\\.}\$"\
-		 2>/dev/null; then
+		 >/dev/null; then
 	    echo "Local port $p is forwarded to $h"
 	else
 	    echo "Forwarding local port $p to $h"
@@ -522,7 +524,7 @@ wait_up() {
 # executes.
 logdevicedctl() {
     varsubst '$LOGDEVICECONFIG_LOC $DATADIR $PACKAGES_ROOT
-              $PORT_CLIENT $PORT_COMMAND $PORT_PROMETHEUS' <<"EOF"
+              $PORT_LD_CLIENT $PORT_LD_COMMAND $PORT_LD_PROMETHEUS' <<"EOF"
 #!/bin/bash
 set -uo pipefail
 
@@ -535,8 +537,8 @@ case "${1-}" in
        >&2 echo "ERROR: $LOGDEVICECONFIG_LOC not found or not readable"
        exit 1
      fi
-     if nc -z localhost $PORT_COMMAND; then
-       >&2 echo "ERROR: LogDevice command port $PORT_COMMAND is in use"
+     if nc -z localhost $PORT_LD_COMMAND; then
+       >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
        exit 1       
      fi
      ulimit -Sc unlimited
@@ -559,15 +561,16 @@ case "${1-}" in
 
      LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced\
           --config-path  $(cat $LOGDEVICECONFIG_LOC) \
-          --port $PORT_CLIENT \
-          --command-port $PORT_COMMAND \
-          --prometheus-listen-addr 0.0.0.0:$PORT_PROMETHEUS \
+          --port $PORT_LD_CLIENT \
+          --command-port $PORT_LD_COMMAND \
+          --prometheus-listen-addr 0.0.0.0:$PORT_LD_PROMETHEUS \
           --local-log-store-path=$DATADIR/ &
      logdeviced_pid=$!
 
      echo $logdeviced_pid > /run/logdeviced.pid
      while [[ $(date +%s) -le $deadline ]]; do
-       running=$(echo info | nc -N -w 10 localhost $PORT_COMMAND | grep '^PID')
+       running=$(echo info | nc -N -w 10 localhost $PORT_LD_COMMAND |\
+                                                               grep '^PID')
        if [[ $? -eq 0 ]]; then
          if echo "$running" | grep -q $logdeviced_pid; then
            exit 0
@@ -582,9 +585,9 @@ case "${1-}" in
      exit 1
      ;;
    stop) 
-     if echo quit | nc -N -w 10 localhost $PORT_COMMAND; then
+     if echo quit | nc -N -w 10 localhost $PORT_LD_COMMAND; then
        while [[ $(date +%s) -le $deadline ]] && \
-             nc -z localhost $PORT_COMMAND; do 
+             nc -z localhost $PORT_LD_COMMAND; do 
          sleep 5
        done
      fi
@@ -740,7 +743,7 @@ EOF
 # Output a Prometheus config file for use on the admin EC2 instance
 # of an awld deployment.
 prometheus_config() {
-    varsubst '$PORT_PROMETHEUS' <<'EOF'
+    varsubst '$PORT_LD_PROMETHEUS $PORT_PROMETHEUS' <<'EOF'
 global:
   scrape_interval:     15s # By default, scrape targets every 15 seconds.
   evaluation_interval: 15s # By default, scrape targets every 15 seconds.
@@ -766,7 +769,7 @@ scrape_configs:
     # scheme defaults to 'http'.
 
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['localhost:$PORT_PROMETHEUS']
 
   - job_name: boxes
     # scrape node exporter on all logdevice cluster nodes
@@ -785,7 +788,7 @@ scrape_configs:
     # scrape logdeviced instances
     ec2_sd_configs:
       - region: us-east-1
-        port: $PORT_PROMETHEUS
+        port: $PORT_LD_PROMETHEUS
 
     relabel_configs:
       - source_labels: [__meta_ec2_tag_logdevice_cluster_name]
@@ -1080,8 +1083,8 @@ nodes_and_internal_config() {
 	else
 	    storage_state=
 	fi
-	if [[ $PORT_SSL -gt 0 ]]; then
-	    ssl_port="\"ssl_port\": $PORT_SSL,"
+	if [[ $PORT_LD_SSL -gt 0 ]]; then
+	    ssl_port="\"ssl_port\": $PORT_LD_SSL,"
 	else
 	    ssl_port=
 	fi
@@ -1090,8 +1093,8 @@ nodes_and_internal_config() {
 $sep{
 	"node_id": $nid,
 	"generation": 1,
-	"host": "$ip:$PORT_CLIENT",
- 	"gossip_port": $PORT_GOSSIP, $ssl_port
+	"host": "$ip:$PORT_LD_CLIENT",
+ 	"gossip_port": $PORT_LD_GOSSIP, $ssl_port
 	"location": "$loc",
         "roles": [ $(quote_words $roles) ],
     	$sequencer_state
@@ -1829,11 +1832,15 @@ EOF
 
 # Output a bash script that when executed on the admin instance as user ubuntu
 # will check if prometheus.service is active, and if it is not, start the
-# service.
+# service, then on success do the same for grafana-server, on failure to
+# start prometheus will not attempt to start grafana-server.
 admin_start_script() {
     cat <<'EOF'
-  systemctl is-active prometheus ||\
-  sudo systemctl enable --quiet --now prometheus && echo started
+  for i in prometheus grafana-server; do
+     systemctl is-active $i || sudo systemctl enable --quiet --now $i
+     if [[ $? -ne 0 ]]; then echo "$i failed to start" ; exit 1; fi
+  done
+  echo "prometheus and grafana-server started"
 EOF
 }
 
@@ -1846,8 +1853,9 @@ start-admin() {
    by allocate-admin. This includes Prometheus, Grafana, as well as one 
    ld-admin-server process for each LogDevice cluster created by awld.
    Services that are already running are not restarted. The command also
-   forwards local port 9090 to the admin instance over ssh for convenient and
-   secure access to Prometheus.
+   forwards local port $PORT_PROMETHEUS and $PORT_GRAFANA to the admin 
+   instance over ssh for convenient and secure access to Prometheus and 
+   Grafana.
 EOF
     local n_admin=$(ninst admin)
     if [[ $n_admin -ne 1 ]]; then
@@ -1859,13 +1867,15 @@ EOF
 
     wait_up ${IIDS[admin]} || exit
 
-    echo "Starting Prometheus and other administrative services"
+    echo "Starting monitoring and administrative services"
 
     admin_start_script | run_on_nodes '[admin]' ${IIDS[admin]} || exit
     
-    forward_ports_to ${IIDS[admin]} 9090 || exit
+    forward_ports_to ${IIDS[admin]} $PORT_PROMETHEUS $PORT_GRAFANA || exit
 
-    echo "Success. You can access Prometheus at http://localhost:9090/"
+    echo\
+     "Success. You can access Prometheus at http://localhost:$PORT_PROMETHEUS/"
+    echo "and Grafana at http://localhost:$PORT_GRAFANA/"
 }
 
 
@@ -2002,10 +2012,12 @@ EOF
 	local status=$?
 	if grep -q "Value ($NODE_INSTANCE_PROFILE) for parameter iamInstanceProfile.name is invalid" $errfile; then
 	cat <<EOF
-  ERROR: failed to run an EC2 instance because instance profile $NODE_INSTANCE_PROFILE
-  was not found. Use AWS console to create IAM role '$NODE_INSTANCE_PROFILE'. 
-  The role must contain AmazonEC2ReadOnlyAccess policy. The EC2 user that 
-  awld runs as must have PassRole permissions for role '$NODE_INSTANCE_PROFILE'.
+  ERROR: failed to run an EC2 instance because instance profile 
+  $NODE_INSTANCE_PROFILE was not found. Use AWS console to create 
+  IAM role '$NODE_INSTANCE_PROFILE'. The role must contain 
+  AmazonEC2ReadOnlyAccess policy. The EC2 user that
+  awld runs as must have PassRole permissions for 
+  role '$NODE_INSTANCE_PROFILE'.
 EOF
 	else
 	    cat $errfile

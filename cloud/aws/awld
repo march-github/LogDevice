@@ -30,7 +30,7 @@ set -uo pipefail
 shopt -s extglob
 
 declare -r NRETRIES=40 # maximum number of retries when checking for
-                       # the completion of instance initialization
+                       # the completion of an AWS operation
 declare -r PAUSE=10    # pause between status polls in seconds
 declare -r SSHOPTS="-oStrictHostKeyChecking=no" # options to pass to ssh,scp
 declare -r CFGPATH=~/.awld # user-defined config settings are read from here
@@ -69,7 +69,7 @@ declare -r NODE_INSTANCE_PROFILE="AWLD"
 # service type. [zk] for Zookeeper, [admin] for the monitoring and
 # administration instance, [bench] for the load generator.  The values
 # are space-separated lists of EC2 instance ids.
-declare -A IIDS=([zk]= [admin]= [bench]=)
+declare -A SERVICE=([zk]= [admin]= [bench]=)
 
 # LogDevice server ports
 declare -r \
@@ -107,7 +107,10 @@ declare -r SSH_KILL_AFTER="1m"  # SIGKILL ssh if still running after timeout
 declare -r PACKAGES_ROOT="/opt/awld/packages"
 
 # timeout(1) for aws s3 operations while uploading and downloading packages
-declare -r PACKAGE_S3_TIMEOUT="5m"   # send SIGINT after this time elapses
+declare -r PACKAGE_S3_TIMEOUT="5m"   # send SIGINT after this much time elapses
+
+declare -r SERVICE_VOL_SIZE_GB=16  # initial size of a service EBS volume in GB
+declare -r SERVICE_VOL_DEV=/dev/sdb # attach service volume as this device
 
 declare -rx AWS_DEFAULT_OUTPUT=text
 
@@ -119,8 +122,9 @@ declare -rx AWS_DEFAULT_OUTPUT=text
 # attribute currently is the space-separated set of infrastructure components
 # required by the command. The format is any combination of:
 #    require-zk require-admin require-bench
-# which indicates that IIDS[zk], IIDS[admin], or IIDS[bench] respectively must
-# be initialized (and errors handled) before running the command.
+# which indicates that SERVICE[zk], SERVICE[admin], or SERVICE[bench]
+# respectively must be initialized (and errors handled) before running
+# the command.
 #
 declare -Ar COMMANDS=(
     [allocate]="create new LogDevice nodes by requesting instances from EC2"
@@ -141,10 +145,10 @@ declare -Ar COMMANDS=(
     [stop]="stop logdeviced on one, several, or all nodes in a cluster"
     [stop-zk]="shut down Zookeeper service and stop all Zookeeper instances, 
               require-zk"
+    [stop-admin]="shut down monitoring and stop the administrative instance
+                require-admin"
     [status]="check whether logdeviced is running"
     [terminate]="terminate EC2 instances and spot requests for a LogDevice cluster"
-    [terminate-admin]="terminate EC2 instance running monitoring and admin services
-                       require-admin"
     [help]="print help"
 )
 
@@ -377,12 +381,12 @@ next_to_last_line() {
 
 
 # Returns the number of allocated instances of shared service of type $1,
-# which must be one of the keys of ${IIDS[]} map.
+# which must be one of the keys of ${SERVICE[]} map.
 ninst() {
-    if [[ ${IIDS[$1]+_} ]]; then    #key exists
-	echo "${IIDS[$1]}" | wc -w
+    if [[ ${SERVICE[$1]+_} ]]; then    #key exists
+	echo "${SERVICE[$1]}" | wc -w
     else
-	2> echo "ABORT: invalid shared service type $1 in $FUNCNAME"
+	>&2 echo "ABORT: invalid service type $1 in $FUNCNAME"
 	exit 1
     fi
 }
@@ -408,7 +412,7 @@ zk_running() {
 # by Zookeeper clients.
 #
 # Set $? to 0 if the number of input entries equals the number of Zookeeper
-# instance ids in ${IIDS[zk]} (all privisioned ZK instances are running).
+# instance ids in ${SERVICE[zk]} (all privisioned ZK instances are running).
 # Otherwise set $? to 1.
 zk_client_config() {
     awk -v cport=$ZKCLTPORT -v nzk=$(ninst zk) \
@@ -425,20 +429,123 @@ get_instance_status() {
 }
 
 
-# Execute a shell command on instance. The instance is expected to be up
-# and accepting ssh connections with key $SSH_KEY
+# Read a bash script from stdin and execute it on the specified instance.
+# The instance is expected to be up and accepting ssh connections.
 #
 # @param $1     : instance id
-# @param $2..$n : commands to execute via bash -c
+# @param $2     : user to log in as (ec2-user for ARM, ubuntu for x86 instances)
 run_on_instance() {
-    local iid=$1 ; shift
-    local cmd="$*"
     timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
-	    ssh -qnT $SSHOPTS ec2-user@$(aws ec2 describe-instances \
-		       --instance-ids $iid \
+	    ssh -qT $SSHOPTS ${2}@$(aws ec2 describe-instances \
+		       --instance-ids $1 \
 		       --query 'Reservations[].Instances[].PublicDnsName'\
-		       --output text) \
-	$cmd
+		       --output text)
+}
+
+
+# Output the full name of a random availability zone in the default AWS
+# region (the one in AWS_REGION variable in .awld config file). Default
+# to zone 'a'.
+random_az() {
+    local -a azs
+    azs=( $(aws ec2 describe-availability-zones\
+		--query AvailabilityZones[].{ZN:ZoneName}) )
+    if [[ $? -ne 0 || ${#azs[@]} -lt 1 ]]; then
+	>&2 echo "WARNING: failed to get the list of availability zones,"\
+	 "defaulting to 'a'"
+	echo ${AWS_REGION}a
+    else
+	echo ${azs[(($RANDOM % ${#azs[@]}))]}
+    fi
+}
+
+
+# If a service EBS volume identified by a (service-name, index) pair exists and
+# is in state 'available', output its volume id to stdout. If the volume is
+# in any other state (in-use, error), or if more than one volume exists for
+# the identifier pair, report an error and exit. If the requested volume does not
+# exist, create it in a random time zone in the default AWS region specified in
+# the .awld config file.
+#
+# @param $1 service    name of service (admin, zk, bench) for which a volume
+#                      is requested
+# @param $2 index      an optional integer id of volume. Ids are small
+#                      ints specific to service.
+get_service_ebs_volume() {
+    declare -r srv=$1
+    declare -r idx=${2-}
+
+    if [[ ! ${SERVICE[$srv]+_} ]]; then
+	>&2 echo "ABORT: unknown service type $srv in $FUNCNAME"
+	exit 1
+    fi
+
+    local idxstr=
+    if [[ -n $idx ]]; then idxstr=" and index $idx"; fi
+    
+    local attrs # "id" and "state" attrubutes of the volume separated by a space
+
+    attrs=$(aws ec2 describe-volumes\
+		--filters "Name=tag:logdevice-$srv,Values=$idx"\
+		--query 'Volumes[*].{ID:VolumeId,ST:State}')
+    
+    if [[ $? -ne 0 ]]; then
+	exit_error "failed to list AWLD EBS volumes for service $srv"
+    fi
+    
+    if [[ -z $attrs ]]; then
+	local az=$(random_az)
+
+	>&2 echo -e "No EBS volume for service ${srv}${idxstr} found."\
+	 "\nCreating a new volume of size $SERVICE_VOL_SIZE_GB GB in $az."
+	
+	attrs=$(aws ec2 create-volume\
+	    --volume-type gp2\
+	    --size $SERVICE_VOL_SIZE_GB\
+	    --availability-zone $az\
+	    --no-encrypted\
+	    --tag-specifications\
+	          "ResourceType=volume,Tags=[{Key=logdevice-$srv,Value='$idx'}]"\
+	    --query '{ID:VolumeId,ST:State}')
+	if [[ $? -ne 0 || -z $attrs ]]; then
+	    exit_error "volume creation failed"
+	fi
+	
+	# wait for volume creation to complete
+	local attempt
+	for attempt in $(seq 1 $NRETRIES); do
+	    sleep 1	    
+	    if [[ ! $attrs =~ ^(vol-[[:alnum:]]+)[[:space:]]+creating$ ]]; then
+		break
+	    fi
+	    attrs=$(aws ec2 describe-volumes\
+			--volume-ids ${BASH_REMATCH[1]}\
+			--query 'Volumes[*].{ID:VolumeId,ST:State}')
+	    if [[ $? -ne 0 || -z $attrs ]]; then
+		exit_error "failed to get state of volume ${BASH_REMATCH[1]}."\
+			   "Abandoning the volume. Delete it manually."
+	    fi
+	    >&2 echo -n .	    
+	done
+	case $attempt in
+	    1) ;;
+	    $NRETRIES) exit_error "Timed out while waiting for the creation of"\
+				  "volume ${BASH_REMATCH[1]} to complete."\
+				  "Delete the volume manually." ;;
+	    *) >&2 echo ;; # attempts 2..N: we have printed one or more dots to
+	                   # stderr. Terminate that line with a newline.
+	esac
+    fi
+
+    if [[ $attrs =~ ^(vol-[[:alnum:]]+)[[:space:]]+available$ ]]; then
+	echo ${BASH_REMATCH[1]}
+	return
+    else
+	exit_error "expected a single volume in state 'available' for "\
+		   "service ${srv}${idxstr}. Got\n$attrs"
+    fi
+
+    exit_error "timed out while waiting for volume creation to complete"
 }
 
 
@@ -467,7 +574,7 @@ forward_ports_to() {
     for p in "$@"; do
 	case $p in
 	    +([0-9])) ;;
-            *) 2> echo "ABORT: invalid parameter in $FUNCNAME."\
+            *) >&2 echo "ABORT: invalid parameter in $FUNCNAME."\
 		"Expected a port number, got $p" ; exit 1 ;;
         esac
         # check if ssh forwarding is already set up for local port $p
@@ -498,7 +605,7 @@ wait_up() {
     # wait until all instances finish initialization or NRETRIES is reached
     for iid in "$@"; do
 	echo "Checking instance $iid"
-	local st
+	local st attempt
 	for attempt in $(seq 1 $NRETRIES); do
 	      st=$(get_instance_status $iid)
 	      if [[ $? -ne 0 ]]; then
@@ -517,6 +624,38 @@ wait_up() {
 	fi
     done
 }
+
+
+# Start the specified EC2 instances (some or all may already be running).
+# On success, execute wait_up() on the instance ids. On failure, log an
+# error to stderr and exit.
+#
+# @param $* ids of instances to start and wait on
+start_and_wait_up() {
+    trap "rm -f /tmp/awld-start-$$.err" EXIT
+
+    local states
+    
+    states=$(aws ec2 start-instances                              \
+		 --instance-ids $*                                \
+		 --query 'StartingInstances[*].CurrentState.Name' \
+	     2>/tmp/awld-start-$$.err)
+
+    if [[ $? -ne 0 ]]; then
+	exit_error "ec2 start-instances operation failed"
+    elif [[ $(echo "$states" | wc -l) != $# ]]; then
+	echo "Some instances failed to start"
+	cat /tmp/awld-start-$$.err
+	exit 1
+    elif echo "$states" | grep -vE "^(pending|running)$"; then
+	exit_error "invalid instance states detected:\n${states}\n\nExiting..."
+    fi
+
+    rm -f /tmp/awld-start-$$.err
+    
+    wait_up $*
+}
+
 
 
 # Output a bash script for starting/stopping/restarting logdeviced on
@@ -967,11 +1106,8 @@ list() {
   field will contain the id of that request. Otherwise sfr is the
   character '-'.  
 EOF
-    # an aws filter that matches all LogDevice node instances that are
-    # either running or coming up. Since we run on local storage, we
-    # don't need instances that are stopping or stopped -- those will lose
-    # their state. Instances that are shutting down or terminted need not
-    # be listed either.
+    # an aws filter that matches all AWLD instances that are
+    # either running or coming up.
     local running_instances='[
       {
         "Name": "instance-state-name",
@@ -1042,7 +1178,7 @@ get_nshards() {
 }
  
 
-# Read lines from stdout in the format of list() containing
+# Read lines from stdin in the format of list() containing
 # configuration details for nodes in a LogDevice cluster, and output
 # the following sections of the LogDevice config file: "nodes", "internal_logs",
 # and "metadata_logs", separated by commas.
@@ -1053,10 +1189,12 @@ nodes_and_internal_config() {
     local sep=   # JSON record separator
     local nid=0  # LogDevice id of next node
     local ids_by_rack=        # loc => (<node-ids>) map
-    declare -A ids_by_rack
-
-    echo '  "nodes": ['
+    local -A ids_by_rack
     
+    echo '  "nodes": ['
+
+    local cn iid itype loc ip hostname roles rest
+
     while read -r cn iid itype loc ip hostname roles rest; do
 	if [[ "$cn" != "$cluster" ]]; then
 	    >&2 echo "ABORT: invalid cluter name in $FUNCNAME."\
@@ -1368,21 +1506,6 @@ EOF
 }
 
 
-terminate-admin() {
-    [[ ${1-} == help ]] && cat <<'EOF' && return    
-   terminate-admin
-
-   Terminate EC2 instance previously allocated by allocate-admin for
-   running monitoring components (Prometheus, Grafana), and the LogDevice 
-   cluster administration service. The monitoring dataset collected 
-   by Prometheus will be lost. The command will search for the admin
-   instance in the AWS region specified in ~/.awld.
-EOF
-
-    aws ec2 terminate-instances --instance-ids ${IIDS[admin]}
-}
-
-
 terminate() {
     [[ ${1-} == help ]] && cat <<'EOF' && return    
    terminate      
@@ -1455,6 +1578,8 @@ EOF
 	echo "$sfrs"
 	exit_error "Inconsistent instance tags."
     fi
+
+    local reply
     
     echo "The following instances and racks will be terminated"
     echo
@@ -1555,7 +1680,7 @@ run_on_nodes() {
     # we first set up log files, then start processes in a separate while
     # loop so that they are subprocesses of _this_ shell rather than of a
     # subprocess, and we can wait(1) on them
-    local logfile
+    local logfile cn iid itype loc ip hostname roles rest
     echo "$nodes" | while read -r cn iid itype loc ip hostname roles rest; do
 	logfile="$log_file_prefix-$iid.log"
 	echo $iid $loc $hostname > $logfile
@@ -1679,7 +1804,7 @@ parse_cluster_filter() {
 
 start() {
     [[ ${1-} == help ]] && cat <<EOF && return    
-   start           
+   $FUNCNAME
 
    Start logdeviced on one, several, or all nodes in a cluster
    logdeviced instances that are already running are ignored Newly
@@ -1756,7 +1881,7 @@ EOF
 
 stop() {
     [[ ${1-} == help ]] && cat <<EOF && return    
-  stop             
+  $FUNCNAME
 
   Stop logdeviced on one, several, or all nodes in a cluster.
 
@@ -1785,7 +1910,7 @@ EOF
 
 status() {
     [[ ${1-} == help ]] && cat <<EOF && return    
-  status           
+  $FUNCNAME
 
   Check whether logdeviced is running on one, several, or all nodes in
   a cluster
@@ -1845,37 +1970,217 @@ EOF
 }
 
 
+admin_stop_script() {
+    echo 'for i in prometheus grafana-server; do sudo systemctl stop $i; done'
+}
+
+zk_stop_script() {
+    echo '/opt/zookeeper/bin/zkServer.sh stop'
+}
+
+
+# Stop all running instances of the specified service. Before stopping the
+# instance run the output of ${servicename}_stop_script function on each
+# running instance of the service.
+#
+# @param $1   servicename   name of the service to stop. Must be one of the
+#                           keys of ${SERVICE[]} map.
+stop_service() {
+    local -r servicename=$1
+    
+    if [[ ! ${SERVICE[$servicename]+_} ]]; then
+	>&2 echo "ABORT: unknown service type $srv in $FUNCNAME"
+	exit 1
+    fi    
+
+    local user  # user id to ssh onto the instances as
+    case $servicename in
+	zk) user="ec2-user" ;;
+	*) user="ubuntu" ;;
+    esac
+    
+    local st
+    for iid in ${SERVICE[$servicename]}; do    
+	st=$(get_instance_status $iid)
+	if [[ $? -ne 0 ]]; then
+	    echo "Failed to get instance status for $iid"
+	    exit 1
+	fi
+	case "$st" in
+	    ok) echo "Stopping AWLD service $servicename on $iid"
+		trap "rm -f /tmp/awld-stop-$iid.err" EXIT
+		${servicename}_stop_script | run_on_instance $iid $user\
+		                                   >/tmp/awld-stop-$iid.err 2>&1
+		if [[ $? -ne 0 ]]; then
+		    echo "Failed"
+		    cat /tmp/awld-stop-$iid.err
+		fi
+		;;
+	    "") echo "No instance status for $iid" ;;
+	    *)  echo "Got unexpected status '$st' for $iid" ;;	    
+	esac
+    done
+  
+    echo "Stopping all EC2 instances for AWLD service $servicename"
+
+    trap "rm -f /tmp/awld-stop-$$.err" EXIT
+    
+    aws ec2 stop-instances --instance-ids ${SERVICE[$servicename]} >/dev/null \
+	2>/tmp/awld-stop-$$.err
+
+    if [[ $? -ne 0 ]]; then
+	echo "aws ec2 stop-instances failed"
+	cat /tmp/awld-stop-$$.err
+	exit 1
+    fi
+
+    rm -f /tmp/awld-stop-$$.err
+    
+    # wait until all instances are fully stopped
+    
+    for iid in ${SERVICE[$servicename]}; do
+	echo "Checking instance $iid"
+	while :; do
+	    state=$(aws ec2 stop-instances --instance-ids $iid --output text \
+			2> /tmp/awld-stop-$iid | \
+			awk '/CURRENTSTATE/{print $3}')
+	    case "$state" in
+		stopping) echo -n . ;;
+		stopped)  echo " stopped" ; break ;;
+		"") echo " Failed to stop" ; cat /tmp/awld-stop-$iid ; exit 1 ;;
+		*) echo " " $state ;; # unexpected state, print it
+	    esac
+	    sleep 2
+	done
+    done
+}
+
+
+allocate-admin() {
+    [[ ${1-} == help ]] && cat <<EOF && return
+  $FUNCNAME
+
+  Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
+  components (Prometheus, Grafana), and the LogDevice cluster administration 
+  service. The instance is created in the AWS region specified in ~/.awld, 
+  and is tagged 'logdevice-admin'. If an instance with that tag already exists
+  in that region, the command does nothing.
+EOF
+
+    local n="$(ninst admin)"
+    case "$n" in
+	0) ;;
+	1) echo "An administrative instance already exists in region"\
+		"$AWS_REGION. Nothing to do."
+	   exit 0
+	   ;;
+	*) >&2 echo "ABORT: unexpected value '$n' returned by ninst admin."\
+	    "Expected 0 or 1."
+	   exit 1
+	   ;;
+    esac
+    
+    check_ssh_key
+    
+    echo "Allocating 1 instance of type ${INSTANCE_TYPES[admin]} for"\
+	 "monitoring and admin services."
+    echo
+
+    local udfile="/tmp/awld-admin-user-data-$$"
+    local errfile="/tmp/awld-run-instances-$$.err"
+    trap "rm -f $udfile $errfile" EXIT
+
+    rm -f $udfile && admin_init_script > $udfile && test -r $udfile
+
+    if [[ $? -ne 0 ]]; then
+	exit_error "Failed to write instance initialization script into $udfile"
+    fi   
+
+    local iid
+    
+    iid=$(aws ec2 run-instances --count 1 \
+	      --image-id $NODE_AMI \
+	      --instance-type ${INSTANCE_TYPES[admin]} \
+	      --key-name $(basename $SSH_KEY) \
+	      --security-group-ids $SECURITY_GROUP \
+	      --iam-instance-profile Name=$NODE_INSTANCE_PROFILE \
+	      --tag-specifications \
+ 	      'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]' \
+	      --block-device-mappings\
+  	      "DeviceName=$SERVICE_VOL_DEV,Ebs={VolumeSize=$SERVICE_VOL_SIZE_GB}"\
+	      --query 'Instances[].{IID:InstanceId}'\
+	      --user-data file://$udfile\
+	  2>$errfile)
+
+    if [[ $? -ne 0 ]]; then
+	local status=$?
+	if grep -q "Value ($NODE_INSTANCE_PROFILE) for parameter iamInstanceProfile.name is invalid" $errfile; then
+	cat <<EOF
+  ERROR: failed to run an EC2 instance because instance profile 
+  $NODE_INSTANCE_PROFILE was not found. Use AWS console to create 
+  IAM role '$NODE_INSTANCE_PROFILE'. The role must contain 
+  AmazonEC2ReadOnlyAccess policy. The EC2 user that
+  awld runs as must have PassRole permissions for 
+  role '$NODE_INSTANCE_PROFILE'.
+EOF
+	else
+	    cat $errfile
+	fi
+	exit $status
+    elif [[ ! $iid =~ ^i-[[:alnum:]]+$ ]]; then
+	exit_error "invalid instance id returned by aws ec2 run-instances"\
+		   "\nExpected i-*, got '$iid'."
+    fi
+
+    echo "Allocated instance $iid."
+}
+
+
 start-admin() {
     [[ ${1-} == help ]] && cat <<EOF && return
-   start-admin
+   $FUNCNAME
 
-   Start all administrative services on the EC2 instance previously allocated
-   by allocate-admin. This includes Prometheus, Grafana, as well as one 
-   ld-admin-server process for each LogDevice cluster created by awld.
-   Services that are already running are not restarted. The command also
-   forwards local port $PORT_PROMETHEUS and $PORT_GRAFANA to the admin 
-   instance over ssh for convenient and secure access to Prometheus and 
+   Start the EC2 instance previously allocated by allocate-admin. Start 
+   all administrative services on that instance. This includes Prometheus, 
+   Grafana, as well as one ld-admin-server process for each LogDevice cluster 
+   created by awld. Services that are already running are not restarted. The 
+   command also forwards local port $PORT_PROMETHEUS and $PORT_GRAFANA to 
+   the admin instance over ssh for convenient and secure access to Prometheus and 
    Grafana.
 EOF
     local n_admin=$(ninst admin)
     if [[ $n_admin -ne 1 ]]; then
-	2> echo "ABORT: $FUNCNAME expected 1 admin instance, got $n_admin."
+	>&2 echo "ABORT: $FUNCNAME expected 1 admin instance, got $n_admin."
 	exit 1
     fi
 
-    echo "Checking that administrative instance is up and running"
-
-    wait_up ${IIDS[admin]} || exit
+    echo "Starting administrative instances"
+    echo
+    
+    start_and_wait_up ${SERVICE[admin]} || exit
 
     echo "Starting monitoring and administrative services"
 
-    admin_start_script | run_on_nodes '[admin]' ${IIDS[admin]} || exit
+    admin_start_script | run_on_nodes '[admin]' ${SERVICE[admin]} || exit
     
-    forward_ports_to ${IIDS[admin]} $PORT_PROMETHEUS $PORT_GRAFANA || exit
+    forward_ports_to ${SERVICE[admin]} $PORT_PROMETHEUS $PORT_GRAFANA || exit
 
     echo\
      "Success. You can access Prometheus at http://localhost:$PORT_PROMETHEUS/"
     echo "and Grafana at http://localhost:$PORT_GRAFANA/"
+}
+
+
+stop-admin() {
+    [[ ${1-} == help ]] && cat <<EOF && return    
+   $FUNCNAME
+
+   Shut down the monitoring components (Prometheus, Grafana), and the LogDevice
+   cluster administration service running on the administrative EC2 instance,
+   then stop the instance.
+EOF
+    
+    stop_service admin
 }
 
 
@@ -1926,7 +2231,7 @@ EOF
 
 allocate-zk() {
     [[ ${1-} == help ]] && cat <<EOF && return
-  allocate-zk       
+  $FUNCNAME
 
   Create and configure up to $ZK_ENSEMBLE_SIZE Zookeeper instances of type 
   ${INSTANCE_TYPES[zk]} in the region specified in ~/.awld. The instances are
@@ -1957,79 +2262,9 @@ EOF
 }
 
 
-allocate-admin() {
-    [[ ${1-} == help ]] && cat <<EOF && return
-  allocate-admin
-
-  Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
-  components (Prometheus, Grafana), and the LogDevice cluster administration 
-  service. The instance is created in the AWS region specified in ~/.awld, 
-  and is tagged 'logdevice-admin'. If an instance with that tag already exists
-  in that region, the command does nothing.
-EOF
-
-    local n="$(ninst admin)"
-    case "$n" in
-	0) ;;
-	1) echo "An administrative instance already exists in region"\
-		"$AWS_REGION. Nothing to do."
-	   exit 0
-	   ;;
-	*) 2> echo "ABORT: unexpected value '$n' returned by ninst admin."\
-	    "Expected 0 or 1."
-	   exit 1
-	   ;;
-    esac
-
-    check_ssh_key
-    
-    echo "Allocating 1 instance of type ${INSTANCE_TYPES[admin]} for"\
-	 "monitoring and admin services."
-    echo
-
-    local udfile="/tmp/awld-admin-user-data-$$"
-    local errfile="/tmp/awld-run-instances-$$.err"
-    trap "rm -f $udfile $errfile" EXIT
-
-    rm -f $udfile && admin_init_script > $udfile && test -r $udfile
-
-    if [[ $? -ne 0 ]]; then
-	exit_error "Failed to write instance initialization script into $udfile"
-    fi
-    
-    aws ec2 run-instances --count 1 \
-	--image-id $NODE_AMI \
-	--instance-type ${INSTANCE_TYPES[admin]} \
-	--key-name $(basename $SSH_KEY) \
-	--security-group-ids $SECURITY_GROUP \
-	--iam-instance-profile Name=$NODE_INSTANCE_PROFILE \
-	--tag-specifications \
- 	'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]' \
-	--user-data file://$udfile \
-	2>$errfile
-
-    if [[ $? -ne 0 ]]; then
-	local status=$?
-	if grep -q "Value ($NODE_INSTANCE_PROFILE) for parameter iamInstanceProfile.name is invalid" $errfile; then
-	cat <<EOF
-  ERROR: failed to run an EC2 instance because instance profile 
-  $NODE_INSTANCE_PROFILE was not found. Use AWS console to create 
-  IAM role '$NODE_INSTANCE_PROFILE'. The role must contain 
-  AmazonEC2ReadOnlyAccess policy. The EC2 user that
-  awld runs as must have PassRole permissions for 
-  role '$NODE_INSTANCE_PROFILE'.
-EOF
-	else
-	    cat $errfile
-	fi
-	exit $status
-    fi
-}
-
-
 start-zk() {
-    [[ ${1-} == help ]] && cat <<'EOF' && return
-  start-zk        
+    [[ ${1-} == help ]] && cat <<EOF && return
+  $FUNCNAME
 
   start all AWS instances previously provisioned for Zookeeper by
   allocate-zk command. Push a new dynamic ensemble config to all running
@@ -2041,19 +2276,7 @@ EOF
     echo "Starting Zookeeper ensemble"
     echo
     
-    aws ec2 start-instances --instance-ids ${IIDS[zk]} --output text \
-	2>/tmp/start-zk.err | grep '^CURRENTSTATE' > /tmp/start-zk
-    if [[ $(cat /tmp/start-zk | wc -l) != $(ninst zk) ]]; then
-	echo "Some instances failed to start"
-	cat /tmp/start-zk.err
-	exit 1
-    fi
-    cat /tmp/start-zk | grep -vE "^CURRENTSTATE[[:blank:]0-9]*(pending|running)"
-    if [[ $? -eq 0 ]]; then
-	exit_error "Invalid states detected. Exiting..."
-    fi   
-
-    wait_up ${IIDS[zk]}
+    start_and_wait_up ${SERVICE[zk]}
 
     # At this point all instances should be up, their ips known.
 
@@ -2078,6 +2301,8 @@ EOF
     echo "Dynamic Zookeeper config file generated"
     echo "$zkdyncfg"
     echo
+
+    local iid ip hostname rest
     
     # copy dynamic Zookeeper configs to instances
     echo "$zkinsts" | while read iid ip hostname rest; do
@@ -2108,15 +2333,15 @@ EOF
     echo "$zkinsts" | while read iid ip hostname rest; do
 	echo "Restarting Zookeeper on instance $iid"
 	echo "($hostname)"
-	trap "rm -f /tmp/start-zk-$iid" EXIT
+	trap "rm -f /tmp/awld-start-zk-$iid" EXIT
 	timeout -k $SSH_KILL_AFTER $SSH_TIMEOUT \
 	     ssh -qnT $SSHOPTS ec2-user@$hostname "\
 		/opt/zookeeper/bin/zkServer.sh stop \
 		&& sleep 2 \
 		&& /opt/zookeeper/bin/zkServer.sh start" \
-	     2>&1 | tee /tmp/start-zk-$iid | grep " zookeeper "
+	     2>&1 | tee /tmp/awld-start-zk-$iid | grep " zookeeper "
 	if [[ $? -ne 0 ]]; then
-	    cat /tmp/start-zk-$iid
+	    cat /tmp/awld-start-zk-$iid
 	    exit_error "Failed to start Zookeeper on instance $iid. Exiting..."
 	fi
     done
@@ -2127,68 +2352,19 @@ EOF
 
 
 stop-zk() {
-    [[ ${1-} == help ]] && cat <<'EOF' && return
-  stop-zk      
+    [[ ${1-} == help ]] && cat <<EOF && return
+  $FUNCNAME
 
-  stop all AWS instances provisioned for Zookeeper, terminate zookeeper servers
+  stop all EC2 instances allocated for Zookeeper, terminate zookeeper servers
   on them.
 EOF
-
-    local st
-    for iid in ${IIDS[zk]}; do    
-	st=$(get_instance_status $iid)
-	if [[ $? -ne 0 ]]; then
-	    echo "Failed to get instance status for $iid"
-	    exit 1
-	fi
-	case "$st" in
-	    ok) echo "Stopping Zookeeper on $iid"
-		trap "rm -f /tmp/stop-zk-$iid" EXIT
-		run_on_instance $iid "/opt/zookeeper/bin/zkServer.sh stop"\
-		                                      >/tmp/stop-zk-$iid 2>&1
-		if [[ $? -ne 0 ]]; then
-		    echo "Failed"
-		    cat /tmp/stop-zk-$iid
-		fi
-		;;
-	    "") echo "No instance status for $iid" ;;
-	    *)  echo "Got unexpected status '$st' for $iid" ;;	    
-	esac
-    done
-  
-    echo "Stopping all Zookeeper EC2 instances"
-    
-    aws ec2 stop-instances --instance-ids ${IIDS[zk]} >/dev/null 2>/tmp/stop-zk
-
-    if [[ $? -ne 0 ]]; then
-	echo "aws ec2 stop-instances failed"
-	cat /tmp/stop-zk
-	exit 1
-    fi
-
-    # wait until all instances are fully stopped
-    
-    for iid in ${IIDS[zk]}; do
-	echo "Checking instance $iid"
-	while :; do
-	    state=$(aws ec2 stop-instances --instance-ids $iid --output text \
-			2> /tmp/stop-zk-$iid | \
-			awk '/CURRENTSTATE/{print $3}')
-	    case "$state" in
-		stopping) echo -n . ;;
-		stopped)  echo " stopped" ; break ;;
-		"") echo " Failed to stop" ; cat /tmp/stop-zk-$iid ; exit 1 ;;
-		*) echo " " $state ;; # unexpected state, print it
-	    esac
-	    sleep 2
-	done
-    done
+    stop_service zk
 }
 
 
 allocate() {
     [[ ${1-} == help ]] && cat <<EOF && return
-  allocate
+  $FUNCNAME
 
   Spot-request EC2 instances for a LogDevice cluster.  All instances
   allocated by a single 'allocate' command will be configured as one
@@ -2425,7 +2601,7 @@ package_name() {
        local timestamp  
        timestamp=$(TZ='America/Los_Angeles' date +'%F_%T' | tr : .)
        if [[ $? -ne 0 || -z $timestamp ]]; then
-	   2> echo "ABORT: Failed to generate a timestamp to expand $version."
+	   >&2 echo "ABORT: Failed to generate a timestamp to expand $version."
 	   exit 1
        fi
        echo $name/${version//@/$timestamp}
@@ -2974,17 +3150,17 @@ for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
 	require-*) s=${a:8} ;;
         *) continue ;;
     esac
-    if [[ ! ${IIDS[$s]+_} ]]; then
-	2> echo "ABORT: unknown service type $s in "\
+    if [[ ! ${SERVICE[$s]+_} ]]; then
+	>&2 echo "ABORT: unknown service type $s in "\
          "require-$s attribute of command specification $CMD"
 	exit 1
     fi
 
-    # command $CMD requires IIDS[$s] to be set to the list
+    # command $CMD requires SERVICE[$s] to be set to the list
     # of EC2 instance ids of allocated instances for the shared service of
     # type $s.
 
-    IIDS[$s]=$(aws ec2 describe-instances \
+    SERVICE[$s]=$(aws ec2 describe-instances \
 	  --output text \
 	  --filters "Name=tag:logdevice-$s,Values=" \
           'Name=instance-state-name,Values=running,pending,stopping,stopped' \

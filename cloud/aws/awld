@@ -111,6 +111,7 @@ declare -r PACKAGE_S3_TIMEOUT="5m"   # send SIGINT after this much time elapses
 
 declare -r SERVICE_VOL_SIZE_GB=16  # initial size of a service EBS volume in GB
 declare -r SERVICE_VOL_DEV=/dev/sdb # attach service volume as this device
+declare -r SERVICE_VOL_MOUNT_PT=/mnt/awld # mount service volume at this path
 
 declare -rx AWS_DEFAULT_OUTPUT=text
 
@@ -135,7 +136,7 @@ declare -Ar COMMANDS=(
     [config]="create and store, or retrieve a cluster configuration file
               require-zk"
     [list]="list running EC2 instances allocated by awld"
-    [package]="create or deploy a logdevice code package, list available packages"
+    [package]="create or deploy a code package, list available packages"
     [start]="start logdeviced on one, several, or all nodes in a cluster
               require-zk"
     [start-zk]="start all Zookeeper instances previously created by allocate-zk
@@ -399,7 +400,7 @@ ninst() {
 # The result may be empty.
 zk_running() {
     aws ec2 describe-instances \
-	--filters "Name=tag:logdevice-zk,Values="\
+	--filters "Name=tag:awld-zk,Values="\
 	          'Name=instance-state-name,Values=running' \
 	--query\
      "Reservations[].Instances[].[InstanceId,PrivateIpAddress,PublicDnsName]"\
@@ -463,20 +464,34 @@ random_az() {
 # If a service EBS volume identified by a (service-name, index) pair exists and
 # is in state 'available', output its volume id to stdout. If the volume is
 # in any other state (in-use, error), or if more than one volume exists for
-# the identifier pair, report an error and exit. If the requested volume does not
-# exist, create it in a random time zone in the default AWS region specified in
-# the .awld config file.
+# the identifier pair, report an error and exit. If the requested volume does
+# not exist, create it in a random time zone in the default AWS region specified
+# in the .awld config file.
 #
-# @param $1 service    name of service (admin, zk, bench) for which a volume
-#                      is requested
-# @param $2 index      an optional integer id of volume. Ids are small
-#                      ints specific to service.
+# Usage: get_service_ebs_volume [ --az <az-name> ] <service-name> [<index>]
+#
+# @param az-name        an optional name of the AZ in which to create a volume
+# @param service-name   name of service (admin, zk, bench) for which to create
+#                       the volume
+# @param index          an optional integer index of volume. Indexes are small
+#                       ints specific to a service.
 get_service_ebs_volume() {
+    local az=  # availability zone in which to create the volume
+
+    case ${1-} in
+	--az) readopt az $@ ; shift ; shift ;;
+    esac
+
+    if [[ $# -lt 1 ]]; then
+	>&2 echo "ABORT: missing service name in $FUNCNAME"
+	exit 1
+    fi
+    
     declare -r srv=$1
     declare -r idx=${2-}
 
     if [[ ! ${SERVICE[$srv]+_} ]]; then
-	>&2 echo "ABORT: unknown service type $srv in $FUNCNAME"
+	>&2 echo "ABORT: unknown service name '$srv' in $FUNCNAME"
 	exit 1
     fi
 
@@ -486,7 +501,7 @@ get_service_ebs_volume() {
     local attrs # "id" and "state" attrubutes of the volume separated by a space
 
     attrs=$(aws ec2 describe-volumes\
-		--filters "Name=tag:logdevice-$srv,Values=$idx"\
+		--filters "Name=tag:awld-$srv,Values=$idx"\
 		--query 'Volumes[*].{ID:VolumeId,ST:State}')
     
     if [[ $? -ne 0 ]]; then
@@ -494,7 +509,7 @@ get_service_ebs_volume() {
     fi
     
     if [[ -z $attrs ]]; then
-	local az=$(random_az)
+	if [[ -z $az ]]; then az=$(random_az); fi
 
 	>&2 echo -e "No EBS volume for service ${srv}${idxstr} found."\
 	 "\nCreating a new volume of size $SERVICE_VOL_SIZE_GB GB in $az."
@@ -505,7 +520,7 @@ get_service_ebs_volume() {
 	    --availability-zone $az\
 	    --no-encrypted\
 	    --tag-specifications\
-	          "ResourceType=volume,Tags=[{Key=logdevice-$srv,Value='$idx'}]"\
+	          "ResourceType=volume,Tags=[{Key=awld-$srv,Value='$idx'}]"\
 	    --query '{ID:VolumeId,ST:State}')
 	if [[ $? -ne 0 || -z $attrs ]]; then
 	    exit_error "volume creation failed"
@@ -634,7 +649,7 @@ wait_up() {
 start_and_wait_up() {
     trap "rm -f /tmp/awld-start-$$.err" EXIT
 
-    local states
+    local states s
     
     states=$(aws ec2 start-instances                              \
 		 --instance-ids $*                                \
@@ -643,13 +658,17 @@ start_and_wait_up() {
 
     if [[ $? -ne 0 ]]; then
 	exit_error "ec2 start-instances operation failed"
-    elif [[ $(echo "$states" | wc -l) != $# ]]; then
+    elif [[ $(echo "$states" | wc -w) != $# ]]; then
 	echo "Some instances failed to start"
 	cat /tmp/awld-start-$$.err
 	exit 1
-    elif echo "$states" | grep -vE "^(pending|running)$"; then
-	exit_error "invalid instance states detected:\n${states}\n\nExiting..."
     fi
+    for s in $states; do
+	case $s in
+	    pending|running) ;;
+	    *) exit_error "invalid instance state detected: $s"
+	esac
+    done
 
     rm -f /tmp/awld-start-$$.err
     
@@ -911,15 +930,16 @@ scrape_configs:
       - targets: ['localhost:$PORT_PROMETHEUS']
 
   - job_name: boxes
-    # scrape node exporter on all logdevice cluster nodes
+    # scrape node exporter on all awld instances
     ec2_sd_configs:
       - region: us-east-1
         port: 9100
 
     relabel_configs:
-      - source_labels: [__meta_ec2_tag_logdevice_cluster_name]
-        regex: ".+"
-        action: keep
+      - source_labels: [__meta_ec2_tag_awld_cluster]
+        target_label: cluster
+      - source_labels: [__meta_ec2_tag_awld_rack]
+        target_label: rack
       - source_labels: [__meta_ec2_instance_id]
         target_label: instance
  
@@ -930,11 +950,77 @@ scrape_configs:
         port: $PORT_LD_PROMETHEUS
 
     relabel_configs:
-      - source_labels: [__meta_ec2_tag_logdevice_cluster_name]
-        regex: ".+"
-        action: keep
+      - source_labels: [__meta_ec2_tag_awld_cluster]
+        target_label: cluster
+      - source_labels: [__meta_ec2_tag_awld_rack]
+        target_label: rack
       - source_labels: [__meta_ec2_instance_id]
         target_label: instance    
+EOF
+}
+
+
+# Output a bash script that when run on a service instance (zk,admin,bench)
+# as root during instance initialization will attempt to create XFS file system
+# on $SERVICE_VOL_DEV, then mount it at path $SERVICE_VOL_MOUNT_PT.
+mount_service_volume() {
+    local dev #internal device name corresponding to external $SERVICE_VOL_DEV
+
+    if [[ $SERVICE_VOL_DEV =~ ^/dev/sd([a-z][0-9]?)$ ]]; then
+	dev=/dev/xvd${BASH_REMATCH[1]}
+    else
+	>&2 echo "ABORT: unexpected \$SERVICE_VOL_DEV value '$SERVICE_VOL_DEV'"
+	>&2 echo 'expected ^/dev/sd([a-z][0-9]?)$'
+	exit 1
+    fi
+    
+    varsubst '$dev $SERVICE_VOL_MOUNT_PT' <<'EOF'
+case $(lsblk -o MOUNTPOINT -n $dev) in
+   $SERVICE_VOL_MOUNT_PT) ;; # already mounted
+   "") (mkfs -t xfs $dev 2>/tmp/mkfs.err ||\
+           grep -q "appears to contain an existing filesystem"\
+	                                     /tmp/mkfs.err 2>/dev/null) &&\
+       mkdir -p $SERVICE_VOL_MOUNT_PT &&\
+       mount -o discard $dev $SERVICE_VOL_MOUNT_PT
+       ;;
+   *) >&2 echo "ERROR: $dev is mounted on a wrong mount point."\
+               "Expected $SERVICE_VOL_MOUNT_PT. Got"
+      >&2 lsblk -o MOUNTPOINT $dev
+      exit 1
+      ;;
+esac    
+EOF
+}
+
+
+# Output a bash script that when run on an admin instance will (a) create
+# a Prometheus data directory on the service volume, (b) change Prometheus
+# systemctl config to pass --storage.tsdb.path flag with that path
+# when starting prometheus service, and (c) compose and write a Prometheus
+# config file into /etc/prometheus/prometheus.yml
+configure_prometheus() {
+    declare -r args="/etc/default/prometheus"
+    declare -r tsdb="$SERVICE_VOL_MOUNT_PT/prometheus/tsdb"
+    cat <<EOS
+mkdir -p $tsdb && \
+chown prometheus:prometheus $(dirname $tsdb) $tsdb && \
+mv $args ${args}.orig && \
+echo 'ARGS="--storage.tsdb.path=$tsdb"' >$args && \
+cat << 'EOF' > /etc/prometheus/prometheus.yml
+$(prometheus_config)
+EOF
+EOS
+}
+
+
+configure_grafana() {
+    declare -r ini="/etc/grafana/grafana.ini"
+    declare -r dest="$SERVICE_VOL_MOUNT_PT/grafana"
+    cat <<EOF
+mkdir -p $dest/data $dest/logs && \
+chown grafana:grafana $dest $dest/data $dest/logs && \
+mv $ini ${ini}.orig && \
+sed -r 's!^;(data|logs) = .*\$!\1 = $dest/\1!' ${ini}.orig > $ini
 EOF
 }
 
@@ -942,7 +1028,7 @@ EOF
 # Output a bash script suitable for use as a UserData (init) script on a
 # newly allocated admin EC2 instance running Prometheus, Grafana, and
 # the LD admin service.
-admin_init_script() {
+admin_init_script() {    
     varsubst '$PACKAGES_ROOT' <<EOF
 #!/bin/bash
 set -uo pipefail
@@ -950,11 +1036,10 @@ set -uo pipefail
 PATH=/usr/local/bin:/usr/bin:/bin:/sbin
 touch /home/ubuntu/.hushlogin
 EOF
-    echo "mkdir -p $PACKAGES_ROOT && chown ubuntu:ubuntu $PACKAGES_ROOT"
-    echo "cat << 'EOF' > /etc/prometheus/prometheus.yml"
-    prometheus_config
-    echo "EOF"
-    echo ""
+    echo "mkdir -p $PACKAGES_ROOT && chown ubuntu:ubuntu $PACKAGES_ROOT"    
+    mount_service_volume
+    configure_prometheus
+    configure_grafana
 }
 
 
@@ -975,9 +1060,9 @@ EOF
 # For all storage types other than "none" instances will be tagged
 # "logdevice-storage" and "logdevice-sequencer". For storage type "none"
 # instances will be tagged "logdevice-sequencer" only.
-# "logdevice-cluster-name" tag of all instances will be set to the cluster
+# "awld-cluster" tag of all instances will be set to the cluster
 #                          name.
-# "logdevice-rack-id" tag on all instances allocated by this call will be
+# "awld-rack" tag on all instances allocated by this call will be
 # set to the same unique string that can be included in the node location spec.
 spot_fleet_request() {
     local cluster=$1
@@ -1044,8 +1129,8 @@ EOF
         {
 	  "ResourceType": "instance",
 	  "Tags": [
-	     { "Key": "logdevice-cluster-name", "Value": "$cluster" },
-             { "Key": "logdevice-rack-id", "Value": "$rack" },
+	     { "Key": "awld-cluster", "Value": "$cluster" },
+             { "Key": "awld-rack", "Value": "$rack" },
 	     $tags
           ]
         }
@@ -1115,10 +1200,10 @@ EOF
       },
       {
         "Name": "tag-key",
-        "Values": ["logdevice-cluster-name",
-                   "logdevice-zk",
-                   "logdevice-admin",
-                   "logdevice-bench"]
+        "Values": ["awld-cluster",
+                   "awld-zk",
+                   "awld-admin",
+                   "awld-bench"]
       }
     ]'
 
@@ -1129,11 +1214,11 @@ EOF
       PrivateIpAddress,
       PublicDnsName,
       Tags[?contains([
-         'logdevice-cluster-name',
-         'logdevice-zk',
-         'logdevice-admin',
-         'logdevice-bench',
-         'logdevice-rack-id',
+         'awld-cluster',
+         'awld-zk',
+         'awld-admin',
+         'awld-bench',
+         'awld-rack',
          'logdevice-storage',
          'logdevice-sequencer',
          'aws:ec2spot:fleet-request-id'],Key)]]"
@@ -1150,11 +1235,11 @@ EOF
                                  substr($3,length($3))) }
       /^logdevice-storage/{ roles=roles c "storage" ; c="," }
       /^logdevice-sequencer/{ roles=roles c "sequencer" ; c="," }
-      /^logdevice-zk/{ cluster="[zk]" ; roles="-" }
-      /^logdevice-admin/{ cluster="[admin]" ; roles="-" }
-      /^logdevice-bench/{ cluster="[bench]" ; roles="-" }
-      /^logdevice-cluster-name/{ cluster=$2 }
-      /^logdevice-rack-id/{ loc=loc".0.0."$2 }
+      /^awld-zk/{ cluster="[zk]" ; roles="-" }
+      /^awld-admin/{ cluster="[admin]" ; roles="-" }
+      /^awld-bench/{ cluster="[bench]" ; roles="-" }
+      /^awld-cluster/{ cluster=$2 }
+      /^awld-rack/{ loc=loc".0.0."$2 }
       /^aws:ec2spot:fleet-request-id/{ sfr=$2 }
       END{ out() }'
 
@@ -2063,15 +2148,16 @@ allocate-admin() {
   Creates one instance of type ${INSTANCE_TYPES[admin]} for running monitoring
   components (Prometheus, Grafana), and the LogDevice cluster administration 
   service. The instance is created in the AWS region specified in ~/.awld, 
-  and is tagged 'logdevice-admin'. If an instance with that tag already exists
+  and is tagged 'awld-admin'. If an instance with that tag already exists
   in that region, the command does nothing.
 EOF
-
+    
     local n="$(ninst admin)"
     case "$n" in
 	0) ;;
-	1) echo "An administrative instance already exists in region"\
-		"$AWS_REGION. Nothing to do."
+	1) echo "Administrative instance ${SERVICE[admin]} already exists"\
+		"in region $AWS_REGION."
+	   echo "Use 'awld start' to start."
 	   exit 0
 	   ;;
 	*) >&2 echo "ABORT: unexpected value '$n' returned by ninst admin."\
@@ -2105,9 +2191,9 @@ EOF
 	      --security-group-ids $SECURITY_GROUP \
 	      --iam-instance-profile Name=$NODE_INSTANCE_PROFILE \
 	      --tag-specifications \
- 	      'ResourceType=instance,Tags=[{Key=logdevice-admin,Value=""}]' \
+ 	      'ResourceType=instance,Tags=[{Key=awld-admin,Value=""}]' \
 	      --block-device-mappings\
-  	      "DeviceName=$SERVICE_VOL_DEV,Ebs={VolumeSize=$SERVICE_VOL_SIZE_GB}"\
+        "DeviceName=$SERVICE_VOL_DEV,Ebs={VolumeSize=$SERVICE_VOL_SIZE_GB}"\
 	      --query 'Instances[].{IID:InstanceId}'\
 	      --user-data file://$udfile\
 	  2>$errfile)
@@ -2154,10 +2240,10 @@ EOF
 	exit 1
     fi
 
-    echo "Starting administrative instances"
+    echo "Starting administrative instance"
     echo
     
-    start_and_wait_up ${SERVICE[admin]} || exit
+    start_and_wait_up ${SERVICE[admin]}
 
     echo "Starting monitoring and administrative services"
 
@@ -2235,7 +2321,7 @@ allocate-zk() {
 
   Create and configure up to $ZK_ENSEMBLE_SIZE Zookeeper instances of type 
   ${INSTANCE_TYPES[zk]} in the region specified in ~/.awld. The instances are
-  tagged 'logdevice-zk'. If some instances so tagged already exist in the
+  tagged 'awld-zk'. If some instances so tagged already exist in the
   region, only create the number necessary to get the ensemble size 
   to $ZK_ENSEMBLE_SIZE. The instances will form a Zookeeper ensemble shared
   among all LogDevice clusters managed by awld.
@@ -2257,7 +2343,7 @@ EOF
 	--key-name $(basename $SSH_KEY) \
 	--security-group-ids $SECURITY_GROUP \
 	--tag-specifications \
- 	  'ResourceType=instance,Tags=[{Key=logdevice-zk,Value=""}]' \
+ 	  'ResourceType=instance,Tags=[{Key=awld-zk,Value=""}]' \
 	--user-data "$(zk_init_script)"
 }
 
@@ -2384,7 +2470,7 @@ allocate() {
     -c|--cluster <name>          REQUIRED
                    LogDevice cluster to which this allocation belongs.
                    All allocated instances will be tagged with
-                   logdevice-cluster-name=<name> 
+                   awld-cluster=<name> 
 
     -n|--size <num-instances>    REQUIRED
 
@@ -3162,7 +3248,7 @@ for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
 
     SERVICE[$s]=$(aws ec2 describe-instances \
 	  --output text \
-	  --filters "Name=tag:logdevice-$s,Values=" \
+	  --filters "Name=tag:awld-$s,Values=" \
           'Name=instance-state-name,Values=running,pending,stopping,stopped' \
 	  --query 'Reservations[].Instances[].[InstanceId]' | sort)
 
@@ -3172,7 +3258,7 @@ for a in $(echo "${COMMANDS[$CMD]}" | sed -n 2p); do
     fi
 
     if [[ $(ninst $s) -eq 0 && "$CMD" != "allocate-$s" ]]; then
-	exit_error "no instances with tag 'logdevice-$s' found. "\
+	exit_error "no instances with tag 'awld-$s' found. "\
 		   "Use 'awld allocate-$s' to provision service."
     fi
     unset s

@@ -173,7 +173,9 @@ declare -Ar PACKAGES=(
     [folly]="folly-prefix/src/folly-build/                      libfolly.so"
 
     [thrift]="fbthrift-prefix/src/fbthrift-build/
-              lib/libthriftcpp2.so lib/libcompiler_generators.so lib/libthriftprotocol.so lib/libprotocol.so lib/libtransport.so lib/libasync.so lib/libthrift-core.so lib/libconcurrency.so lib/libthriftfrozen2.so lib/libcompiler_generate_templates.so lib/libcompiler_base.so lib/libcompiler_lib.so lib/libmustache_lib.so lib/libcompiler_ast.so"                 
+              lib/libthriftcpp2.so lib/libcompiler_generators.so lib/libthriftprotocol.so lib/libprotocol.so lib/libtransport.so lib/libasync.so lib/libthrift-core.so lib/libconcurrency.so lib/libthriftfrozen2.so lib/libcompiler_generate_templates.so lib/libcompiler_base.so lib/libcompiler_lib.so lib/libmustache_lib.so lib/libcompiler_ast.so"
+
+    [clients]="./                                    bin/ldwrite bin/ldtail"
 )
 
 # an extended glob matching names of all supported commands
@@ -676,7 +678,6 @@ start_and_wait_up() {
 }
 
 
-
 # Output a bash script for starting/stopping/restarting logdeviced on
 # a LogDevice node. This script is what logdeviced.service systemd unit
 # executes.
@@ -901,7 +902,7 @@ EOF
 # Output a Prometheus config file for use on the admin EC2 instance
 # of an awld deployment.
 prometheus_config() {
-    varsubst '$PORT_LD_PROMETHEUS $PORT_PROMETHEUS' <<'EOF'
+    varsubst '$PORT_LD_PROMETHEUS $PORT_PROMETHEUS $AWS_REGION' <<'EOF'
 global:
   scrape_interval:     15s # By default, scrape targets every 15 seconds.
   evaluation_interval: 15s # By default, scrape targets every 15 seconds.
@@ -932,7 +933,7 @@ scrape_configs:
   - job_name: boxes
     # scrape node exporter on all awld instances
     ec2_sd_configs:
-      - region: us-east-1
+      - region: $AWS_REGION
         port: 9100
 
     relabel_configs:
@@ -946,10 +947,13 @@ scrape_configs:
   - job_name: logdevice
     # scrape logdeviced instances
     ec2_sd_configs:
-      - region: us-east-1
+      - region: $AWS_REGION
         port: $PORT_LD_PROMETHEUS
 
     relabel_configs:
+      - source_labels: [__meta_ec2_tag_awld_cluster]
+        regex: (.+)
+        action: keep
       - source_labels: [__meta_ec2_tag_awld_cluster]
         target_label: cluster
       - source_labels: [__meta_ec2_tag_awld_rack]
@@ -973,7 +977,7 @@ mount_service_volume() {
 	>&2 echo 'expected ^/dev/sd([a-z][0-9]?)$'
 	exit 1
     fi
-    
+
     varsubst '$dev $SERVICE_VOL_MOUNT_PT' <<'EOF'
 case $(lsblk -o MOUNTPOINT -n $dev) in
    $SERVICE_VOL_MOUNT_PT) ;; # already mounted
@@ -981,7 +985,8 @@ case $(lsblk -o MOUNTPOINT -n $dev) in
            grep -q "appears to contain an existing filesystem"\
 	                                     /tmp/mkfs.err 2>/dev/null) &&\
        mkdir -p $SERVICE_VOL_MOUNT_PT &&\
-       mount -o discard $dev $SERVICE_VOL_MOUNT_PT
+       mount -o discard $dev $SERVICE_VOL_MOUNT_PT &&\
+       echo "$dev $SERVICE_VOL_MOUNT_PT xfs defaults,discard 0 0" >>/etc/fstab
        ;;
    *) >&2 echo "ERROR: $dev is mounted on a wrong mount point."\
                "Expected $SERVICE_VOL_MOUNT_PT. Got"
@@ -2057,10 +2062,11 @@ EOF
 
 admin_stop_script() {
     echo 'for i in prometheus grafana-server; do sudo systemctl stop $i; done'
+    echo 'sync'
 }
 
 zk_stop_script() {
-    echo '/opt/zookeeper/bin/zkServer.sh stop'
+    echo '/opt/zookeeper/bin/zkServer.sh stop; sync'
 }
 
 
@@ -2876,7 +2882,7 @@ install_package_on_node() {
 	>&2 echo "ABORT: invalid S3 URL '$object' passed to $FUNCNAME"
 	exit 1
     fi	
-    
+
     # Path to current logdevice package on nodes. This is a symlink to the
     # current package directory, e.g.
     # $PACKAGES_ROOT/logdevice/current ->
@@ -2890,9 +2896,9 @@ install_package_on_node() {
 	 "is not writable"
 	exit 1
     fi
-    
+
     cd $packages_root && mkdir -p $name && cd $name || exit
-   
+
     if [[ -a $version ]]; then
 	echo "package directory exists"
     else
@@ -2913,7 +2919,7 @@ install_package_on_node() {
     fi
 
     echo "setting $name/current -> $version"
-    
+
     ln -sfn $version current || exit
 
     # ld.so.conf include populated by awld
@@ -2932,7 +2938,7 @@ install_package_on_node() {
 	cp /tmp/awld.$$.ldsoconf $ldsoconf &&\
 	rm -f /tmp/awld.$$.ldsoconf &&\
 	sudo /sbin/ldconfig
-    
+
     #TODO: delete all version directories in $packages_root that
     # do not appear in $@
 }

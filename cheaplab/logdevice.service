@@ -1,0 +1,22 @@
+[Unit]
+Description=LogDevice node
+Documentation=https://logdevice.io/docs/Overview.html
+After=network.target
+StartLimitIntervalSec=20
+StartLimitBurst=2
+
+[Service]
+Type=forking
+PIDFile=/run/logdeviced.pid
+ExecStart=${PACKAGES_ROOT}/logdevice/current/logdevicedctl start
+ExecStop=${PACKAGES_ROOT}/logdevice/current/logdevicedctl stop
+StandardError=journal
+SyslogIdentifier=logdeviced
+RestartSec=5
+Restart=on-abort
+TimeoutStartSec=120
+TimeoutStopSec=120
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

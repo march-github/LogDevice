@@ -1,0 +1,77 @@
+#!/bin/bash
+set -uo pipefail
+
+LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
+PORT_LD_CLIENT=16001
+PORT_LD_COMMAND=16005
+
+timeout=${2-60}
+deadline=$(($(date +%s)+$timeout))
+
+case "${1-}" in
+   start) 
+     if [[ ! -r $LOGDEVICECONFIG_LOC ]]; then
+       >&2 echo "ERROR: $LOGDEVICECONFIG_LOC not found or not readable"
+       exit 1
+     fi
+     if nc -z localhost $PORT_LD_COMMAND; then
+       >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
+       exit 1       
+     fi
+     ulimit -Sc unlimited
+     CURRENT_PACKAGE=$PACKAGES_ROOT/logdevice/current
+     if [[ ! -h $CURRENT_PACKAGE ]]; then
+       >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
+       exit 1
+     fi
+     cd $CURRENT_PACKAGE 2>/dev/null
+     if [[ $? -ne 0 ]]; then
+       >&2 echo "ERROR: failed to cd to current package directory"\
+                $(readlink -m $CURRENT_PACKAGE)
+       exit 1
+     fi
+     if [[ ! -x bin/logdeviced ]]; then
+       >&2 echo "ERROR: $CURRENT_PACKAGE/bin/logdeviced not found"\
+                "or not executable"
+       exit 1
+     fi
+
+     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced\
+          --config-path  $(cat $LOGDEVICECONFIG_LOC) \
+          --port $PORT_LD_CLIENT \
+          --command-port $PORT_LD_COMMAND \
+          --prometheus-listen-addr 0.0.0.0:$PORT_PROMETHEUS_SCRAPE \
+          --local-log-store-path=$DATADIR/ &
+     logdeviced_pid=$!
+
+     echo $logdeviced_pid > /run/logdeviced.pid
+     while [[ $(date +%s) -le $deadline ]]; do
+       running=$(echo info | nc -N -w 10 localhost $PORT_LD_COMMAND |\
+                                                               grep '^PID')
+       if [[ $? -eq 0 ]]; then
+         if echo "$running" | grep -q $logdeviced_pid; then
+           exit 0
+         else
+           >&2 echo "ERROR: another logdeviced instance is already running"
+           exit 1
+         fi
+       fi
+       kill -0 $logdeviced_pid 2>/dev/null || exit 1
+       sleep 2
+     done
+     exit 1
+     ;;
+   stop) 
+     if echo quit | nc -N -w 10 localhost $PORT_LD_COMMAND; then
+       while [[ $(date +%s) -le $deadline ]] && \
+             nc -z localhost $PORT_LD_COMMAND; do 
+         sleep 5
+       done
+     fi
+     exit 0
+     ;;
+   "") echo "Usage: logdevicedctl start|stop [timeout_seconds]" 
+     ;;
+   *) echo "ERROR: Invalid command: $1" ; exit 1
+     ;;
+esac

@@ -2,14 +2,45 @@
 set -uo pipefail
 
 LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
-PORT_LD_CLIENT=16001
-PORT_LD_COMMAND=16005
+declare -r PORT_LD_CLIENT=16001
+declare -r PORT_LD_COMMAND=16005
+declare -r ZKCLTPORT=2181
+declare -r MINZKUP=2  # minimum number of running or starting ZK instances
 
 timeout=${2-60}
 deadline=$(($(date +%s)+$timeout))
 
+# Query EC2 to get the list of internal ip addresses of all running or
+# starting instances with cheaplab-zk tag. If any are found, output a
+# Zookeeper URL 
+get_zookeeper_url() {
+    local -a zkips
+    zkips=( $(aws ec2 describe-instances                                     \
+	--filters 'Name=tag-key,Values=cheaplab-zk'                          \
+	          'Name=instance-state-name,Values=running,starting'         \
+	--query "Reservations[].Instances[].[PrivateIpAddress]"              \
+	--output text) ) || return
+
+    if [[ ${#zkips[@]} -lt $MINZKUP ]]; then
+	>&2 echo "Too few Zookeeper EC2 instances in state 'running' or"\
+	    "'starting'. Expected $MINZKUP instances, got ${zkips[*]}"
+	return 1
+    fi
+
+    echo -n "zk:"
+
+    local i
+    local sep=
+    for i in ${#zkips[@]}; do
+	echo -n ${sep}$i:${ZKCLTPORT}
+	sep=,
+    done
+    echo "/"
+}
+
 case "${1-}" in
-   start) 
+    start)     
+	
      if [[ ! -r $LOGDEVICECONFIG_LOC ]]; then
        >&2 echo "ERROR: $LOGDEVICECONFIG_LOC not found or not readable"
        exit 1

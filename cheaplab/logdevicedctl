@@ -1,24 +1,42 @@
 #!/bin/bash
 set -uo pipefail
 
-LOGDEVICECONFIG_LOC="/home/ubuntu/logdeviceconfig.loc"
 declare -r PORT_LD_CLIENT=16001
 declare -r PORT_LD_COMMAND=16005
 declare -r ZKCLTPORT=2181
-declare -r MINZKUP=2  # minimum number of running or starting ZK instances
 
-timeout=${2-60}
-deadline=$(($(date +%s)+$timeout))
+declare -r timeout=${2-60}
+declare -r deadline=$(($(date +%s)+$timeout))
 
-# Query EC2 to get the list of internal ip addresses of all running or
-# starting instances with cheaplab-zk tag. If any are found, output a
-# Zookeeper URL 
+
+get_this_instance_id() {
+    curl -sS -m 10 http://169.254.169.255/latest/meta-data/instance-id
+}
+
+get_this_instance_az() {
+    curl -sS -m 10 \
+	 http://169.254.169.254/latest/meta-data/placement/availability-zone
+}
+
+# Output the list of internal ip addresses of all running or
+# starting EC2 instances with tag cheaplab-zk. If at least $MINZKUP
+# such instances are found, output a Zookeeper URL of the form
+# zk://<ip:port>{,<ip:port>}/ that ZK clients can user to contact the
+# Zookeeper ensemble. Otherwise log an error to stderr and return failure.
+#
+# @param  $1   region    name of AWS region where Zookeeper ensemble is running
+#                        (cross-region ensembles are not supported yet)
 get_zookeeper_url() {
+    declare -r region=$1
+    declare -r MINZKUP=2  # minimum required number of running or starting
+                          # Zookeeper instances
     local -a zkips
+
     zkips=( $(aws ec2 describe-instances                                     \
 	--filters 'Name=tag-key,Values=cheaplab-zk'                          \
 	          'Name=instance-state-name,Values=running,starting'         \
 	--query "Reservations[].Instances[].[PrivateIpAddress]"              \
+	--region $region                                                     \	  
 	--output text) ) || return
 
     if [[ ${#zkips[@]} -lt $MINZKUP ]]; then
@@ -29,27 +47,46 @@ get_zookeeper_url() {
 
     echo -n "zk:"
 
-    local i
+    local ip
     local sep=
-    for i in ${#zkips[@]}; do
-	echo -n ${sep}$i:${ZKCLTPORT}
+    for ip in ${zkips[@]}; do
+	echo -n ${sep}$ip:$ZKCLTPORT
 	sep=,
     done
     echo "/"
 }
 
+
+# Output the value of 'cheaplab-cluster' tag of this instance, if such a
+# tag exists.
+#
+# @param  $1   region    name of AWS region where Zookeeper is running
+get_this_cluster_id() {
+    declare -r region=$1
+    local iid
+
+    iid=$(get_this_instance_id)
+    if [[ $? -ne 0 || -z $iid ]]; then
+	>&2 echo "ERROR: failed to get this instance id from EC2"
+	exit 1
+    fi
+    
+    aws ec2 describe-instances \
+	--instance-ids=$iid    \
+	--region $region       \
+	--query                \
+   "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
+	--output text
+}
+
+
 case "${1-}" in
-    start)     
-	
-     if [[ ! -r $LOGDEVICECONFIG_LOC ]]; then
-       >&2 echo "ERROR: $LOGDEVICECONFIG_LOC not found or not readable"
-       exit 1
-     fi
+   start)         
      if nc -z localhost $PORT_LD_COMMAND; then
        >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
        exit 1       
      fi
-     ulimit -Sc unlimited
+
      CURRENT_PACKAGE=$PACKAGES_ROOT/logdevice/current
      if [[ ! -h $CURRENT_PACKAGE ]]; then
        >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
@@ -67,12 +104,38 @@ case "${1-}" in
        exit 1
      fi
 
-     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced\
-          --config-path  $(cat $LOGDEVICECONFIG_LOC) \
-          --port $PORT_LD_CLIENT \
-          --command-port $PORT_LD_COMMAND \
+     az=$(get_this_instance_az)
+     if [[ $? -ne 0 || -z $az ]]; then
+	 >&2 echo "ERROR: failed to get availability zone from EC2"
+	 exit 1
+     fi
+     region=${az:0:-1}  # drop last char
+     zk=$(get_zookeeper_url $region) || exit
+
+     cluster=$(get_this_cluster_id $region)
+     if [[ $? -ne 0 ]]; then
+	 >&2 echo "ERROR: failed to get cluster id"
+	 exit 1
+     elif [[ -z $cluster ]]; then
+	 >&2 echo "ERROR: could not determine cluster id because "\
+	     "cheaplab-cluster tag is missing or empty on this instance."
+	 exit 1
+     elif [[ $cluster =~ ^logdevice/([[:word:]]+)$ ]]; then
+	 cluster_name=${BASH_REMATCH[1]}
+     else
+	 >&2 echo "ERROR: unexpected cluster name $cluster."\
+	     "Expected logdevice/[[:word:]]+"
+	 exit 1
+     fi 
+
+     ulimit -Sc unlimited     
+     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced         \
+          --config-path  $zk/conf/${cluster_name}.conf             \
+          --port $PORT_LD_CLIENT                                   \
+          --command-port $PORT_LD_COMMAND                          \
           --prometheus-listen-addr 0.0.0.0:$PORT_PROMETHEUS_SCRAPE \
-          --local-log-store-path=$DATADIR/ &
+          --local-log-store-path=$DATADIR/                         \
+	  $ARGS &
      logdeviced_pid=$!
 
      echo $logdeviced_pid > /run/logdeviced.pid
@@ -92,6 +155,7 @@ case "${1-}" in
      done
      exit 1
      ;;
+
    stop) 
      if echo quit | nc -N -w 10 localhost $PORT_LD_COMMAND; then
        while [[ $(date +%s) -le $deadline ]] && \
@@ -101,8 +165,10 @@ case "${1-}" in
      fi
      exit 0
      ;;
+
    "") echo "Usage: logdevicedctl start|stop [timeout_seconds]" 
      ;;
-   *) echo "ERROR: Invalid command: $1" ; exit 1
+
+   *) >&2 echo "ERROR: Invalid command: $1" ; exit 1
      ;;
 esac

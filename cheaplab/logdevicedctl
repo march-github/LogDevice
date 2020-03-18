@@ -4,6 +4,7 @@ set -uo pipefail
 declare -r PORT_LD_CLIENT=16001
 declare -r PORT_LD_COMMAND=16005
 declare -r ZKCLTPORT=2181
+declare -r ZK=zookeeper/shared   # name of Zookeeper cluster to use
 
 declare -r timeout=${2-60}
 declare -r deadline=$(($(date +%s)+$timeout))
@@ -24,8 +25,9 @@ get_this_instance_az() {
 # zk://<ip:port>{,<ip:port>}/ that ZK clients can user to contact the
 # Zookeeper ensemble. Otherwise log an error to stderr and return failure.
 #
-# @param  $1   region    name of AWS region where Zookeeper ensemble is running
-#                        (cross-region ensembles are not supported yet)
+# @param  $1   region    name of AWS region where Zookeeper ensemble is
+#                        running (cross-region ensembles are not supported
+#                        yet)
 get_zookeeper_url() {
     declare -r region=$1
     declare -r MINZKUP=2  # minimum required number of running or starting
@@ -36,7 +38,7 @@ get_zookeeper_url() {
 	--filters 'Name=tag-key,Values=cheaplab-zk'                          \
 	          'Name=instance-state-name,Values=running,starting'         \
 	--query "Reservations[].Instances[].[PrivateIpAddress]"              \
-	--region $region                                                     \	  
+	--region $region                                                     \
 	--output text) ) || return
 
     if [[ ${#zkips[@]} -lt $MINZKUP ]]; then
@@ -75,19 +77,27 @@ get_this_cluster_id() {
 	--instance-ids=$iid    \
 	--region $region       \
 	--query                \
-   "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
+ "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
 	--output text
 }
 
 
 case "${1-}" in
    start)         
+     for v in LAB_PACKAGES_ROOT LAB_DATADIR LAB_PORT_PROMETHEUS_SCRAPE\
+				  LAB_CLUSTER LAB_ARGS; do
+	 if [[ -z ${!v+_} ]]; then
+	     >&2 echo "ABORT: $v is not set in the environment."\
+		 "It was expected to be set by CheapLab."
+	     exit 1
+	 fi
+     done
      if nc -z localhost $PORT_LD_COMMAND; then
        >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
        exit 1       
      fi
 
-     CURRENT_PACKAGE=$PACKAGES_ROOT/logdevice/current
+     CURRENT_PACKAGE=$LAB_PACKAGES_ROOT/logdevice/current
      if [[ ! -h $CURRENT_PACKAGE ]]; then
        >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
        exit 1
@@ -119,9 +129,13 @@ case "${1-}" in
      elif [[ -z $cluster ]]; then
 	 >&2 echo "ERROR: could not determine cluster id because "\
 	     "cheaplab-cluster tag is missing or empty on this instance."
-	 exit 1
+	 exit 1	 
      elif [[ $cluster =~ ^logdevice/([[:word:]]+)$ ]]; then
 	 cluster_name=${BASH_REMATCH[1]}
+         if [[ $cluster != $LAB_CLUSTER ]]; then
+	     >&2 echo "ABORT: cheaplab-cluster tag '$cluster' does not"\
+	     "match LAB_CLUSTER value '$LAB_CLUSTER' set in the environment."
+	     exit 1
      else
 	 >&2 echo "ERROR: unexpected cluster name $cluster."\
 	     "Expected logdevice/[[:word:]]+"
@@ -129,13 +143,13 @@ case "${1-}" in
      fi 
 
      ulimit -Sc unlimited     
-     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced         \
-          --config-path  $zk/conf/${cluster_name}.conf             \
-          --port $PORT_LD_CLIENT                                   \
-          --command-port $PORT_LD_COMMAND                          \
-          --prometheus-listen-addr 0.0.0.0:$PORT_PROMETHEUS_SCRAPE \
-          --local-log-store-path=$DATADIR/                         \
-	  $ARGS &
+     LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced             \
+          --config-path  $zk/conf/${cluster_name}.conf                 \
+          --port $PORT_LD_CLIENT                                       \
+          --command-port $PORT_LD_COMMAND                              \
+          --prometheus-listen-addr 0.0.0.0:$LAB_PORT_PROMETHEUS_SCRAPE \
+          --local-log-store-path=$LAB_DATADIR/                         \
+	  $LAB_ARGS &
      logdeviced_pid=$!
 
      echo $logdeviced_pid > /run/logdeviced.pid

@@ -11,7 +11,7 @@ declare -r deadline=$(($(date +%s)+$timeout))
 
 
 get_this_instance_id() {
-    curl -sS -m 10 http://169.254.169.255/latest/meta-data/instance-id
+    curl -sS -m 10 http://169.254.169.254/latest/meta-data/instance-id
 }
 
 get_this_instance_az() {
@@ -130,17 +130,19 @@ case "${1-}" in
 	 >&2 echo "ERROR: could not determine cluster id because "\
 	     "cheaplab-cluster tag is missing or empty on this instance."
 	 exit 1	 
-     elif [[ $cluster =~ ^logdevice/([[:word:]]+)$ ]]; then
+     elif [[ $cluster =~ ^logdevice/([[:alnum:]_]+)$ ]]; then
 	 cluster_name=${BASH_REMATCH[1]}
          if [[ $cluster != $LAB_CLUSTER ]]; then
 	     >&2 echo "ABORT: cheaplab-cluster tag '$cluster' does not"\
 	     "match LAB_CLUSTER value '$LAB_CLUSTER' set in the environment."
 	     exit 1
+	 fi
+	 # fall through
      else
 	 >&2 echo "ERROR: unexpected cluster name $cluster."\
-	     "Expected logdevice/[[:word:]]+"
+	     "Expected logdevice/[[:alnum:]_]+"
 	 exit 1
-     fi 
+     fi
 
      ulimit -Sc unlimited     
      LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced             \

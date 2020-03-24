@@ -22,7 +22,7 @@ get_this_instance_az() {
 # Output the list of internal ip addresses of all running or
 # starting EC2 instances with tag cheaplab-zk. If at least $MINZKUP
 # such instances are found, output a Zookeeper URL of the form
-# zk://<ip:port>{,<ip:port>}/ that ZK clients can user to contact the
+# zk://<ip:port>{,<ip:port>} that ZK clients can user to contact the
 # Zookeeper ensemble. Otherwise log an error to stderr and return failure.
 #
 # @param  $1   region    name of AWS region where Zookeeper ensemble is
@@ -55,7 +55,6 @@ get_zookeeper_url() {
 	echo -n ${sep}$ip:$ZKCLTPORT
 	sep=,
     done
-    echo "/"
 }
 
 
@@ -72,7 +71,7 @@ get_this_cluster_id() {
 	>&2 echo "ERROR: failed to get this instance id from EC2"
 	exit 1
     fi
-    
+
     aws ec2 describe-instances \
 	--instance-ids=$iid    \
 	--region $region       \
@@ -83,7 +82,7 @@ get_this_cluster_id() {
 
 
 case "${1-}" in
-   start)         
+   start)
      for v in LAB_PACKAGES_ROOT LAB_DATADIR LAB_PORT_PROMETHEUS_SCRAPE\
 				  LAB_CLUSTER LAB_ARGS; do
 	 if [[ -z ${!v+_} ]]; then
@@ -94,7 +93,7 @@ case "${1-}" in
      done
      if nc -z localhost $PORT_LD_COMMAND; then
        >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
-       exit 1       
+       exit 1
      fi
 
      CURRENT_PACKAGE=$LAB_PACKAGES_ROOT/logdevice/current
@@ -129,7 +128,7 @@ case "${1-}" in
      elif [[ -z $cluster ]]; then
 	 >&2 echo "ERROR: could not determine cluster id because "\
 	     "cheaplab-cluster tag is missing or empty on this instance."
-	 exit 1	 
+	 exit 1
      elif [[ $cluster =~ ^logdevice/([[:alnum:]_]+)$ ]]; then
 	 cluster_name=${BASH_REMATCH[1]}
          if [[ $cluster != $LAB_CLUSTER ]]; then
@@ -144,9 +143,9 @@ case "${1-}" in
 	 exit 1
      fi
 
-     ulimit -Sc unlimited     
+     ulimit -Sc unlimited
      LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced             \
-          --config-path  $zk/conf/${cluster_name}.conf                 \
+          --config-path  ${zk}/conf/logdevice/${cluster_name}.conf     \
           --port $PORT_LD_CLIENT                                       \
           --command-port $PORT_LD_COMMAND                              \
           --prometheus-listen-addr 0.0.0.0:$LAB_PORT_PROMETHEUS_SCRAPE \
@@ -172,17 +171,17 @@ case "${1-}" in
      exit 1
      ;;
 
-   stop) 
+   stop)
      if echo quit | nc -N -w 10 localhost $PORT_LD_COMMAND; then
        while [[ $(date +%s) -le $deadline ]] && \
-             nc -z localhost $PORT_LD_COMMAND; do 
+             nc -z localhost $PORT_LD_COMMAND; do
          sleep 5
        done
      fi
      exit 0
      ;;
 
-   "") echo "Usage: logdevicedctl start|stop [timeout_seconds]" 
+   "") echo "Usage: logdevicedctl start|stop [timeout_seconds]"
      ;;
 
    *) >&2 echo "ERROR: Invalid command: $1" ; exit 1

@@ -39,6 +39,7 @@ set(THRIFT1 ${BINARY_DIR}/bin/thrift1)
 #set(THRIFTCPP2 ${BINARY_DIR}/lib/libthriftcpp2.a)
 
 set(FBTHRIFT_LIBRARIES
+    ${BINARY_DIR}/lib/libcompiler_generate_templates.so
     ${BINARY_DIR}/lib/libprotocol.so
     ${BINARY_DIR}/lib/libthriftcpp2.so
     ${BINARY_DIR}/lib/libcompiler_ast.so

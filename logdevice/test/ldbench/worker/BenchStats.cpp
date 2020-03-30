@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <iostream>
+#include <cstdlib>
 
 namespace facebook { namespace logdevice { namespace ldbench {
 
@@ -34,6 +35,9 @@ int64_t BenchStats::getAttr(StatsType attr) const {
       return skipped_;
     case StatsType::INFLIGHT:
       return in_flight_;
+    default:
+      abort();
+      return 0;
   }
 }
 

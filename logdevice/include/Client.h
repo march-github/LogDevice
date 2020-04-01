@@ -966,9 +966,10 @@ class Client {
    * by an internal LogDevice thread, and having one wait for another could
    * result in deadlock. Use the async version below.
    *
-   * @return  If configuration has a log with "name" attribute @param name,
-   *          returns the LogGroup object that contains the attributes for
-   *          that entry.
+   * @return  If a log group exists at the specified path in the log tree of
+   *          this LogDevice cluster, returns a LogGroup object describing
+   *          that log group. If no group exists at the path, or if an error
+   *          occurred, returns nullptr and sets logdevice::err.
    */
   virtual std::unique_ptr<client::LogGroup>
   getLogGroupSync(const std::string& path) noexcept = 0;

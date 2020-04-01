@@ -36,6 +36,9 @@ add_executable(ldbuffwrite
   ${LOGDEVICE_EXAMPLES_DIR}/parse_target_log.h
   ${LOGDEVICE_EXAMPLES_DIR}/parse_target_log.cpp)
 
+add_executable(ldmakelogs
+  ${LOGDEVICE_EXAMPLES_DIR}/makelogs.cpp)
+
 auto_sources(cluster_hfiles "*.h" RECURSE "${LOGDEVICE_DIR}/test/utils")
 auto_sources(cluster_files "*.cpp" RECURSE "${LOGDEVICE_DIR}/test/utils")
 auto_sources(cluster_testutil_files "*TestUtil.cpp" RECURSE
@@ -88,7 +91,13 @@ target_link_libraries(ldwrite
 target_link_libraries(ldbuffwrite
   ldclient
   ${LOGDEVICE_EXTERNAL_DEPS}
-)
+  )
+
+target_link_libraries(ldmakelogs
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+  )
 
 add_custom_target(examples)
-add_dependencies(examples ldcat ldtail ldtailasync ldtrim ldwrite ldbuffwrite)
+add_dependencies(examples
+                 ldcat ldtail ldtailasync ldtrim ldwrite ldbuffwrite ldmakelogs)

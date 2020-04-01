@@ -96,7 +96,7 @@ case "${1-}" in
        exit 1
      fi
 
-     CURRENT_PACKAGE=$LAB_PACKAGES_ROOT/logdevice/current
+     CURRENT_PACKAGE=$LAB_PACKAGES_ROOT/logdeviced/current
      if [[ ! -h $CURRENT_PACKAGE ]]; then
        >&2 echo "ERROR: $CURRENT_PACKAGE does not exist or not a symlink"
        exit 1

@@ -18,6 +18,5 @@ include_directories(${PYTHON_INCLUDE_DIRS})
 add_executable(ldbench ${hfiles} ${files})
 
 target_link_libraries(ldbench
-  common
-  ldclient_static
+  ldclient
   ${LOGDEVICE_EXTERNAL_DEPS})

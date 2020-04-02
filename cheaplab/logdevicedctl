@@ -2,9 +2,10 @@
 set -uo pipefail
 
 declare -r PORT_LD_CLIENT=16001
-declare -r PORT_LD_COMMAND=16005
+declare -r PORT_LD_ADMIN=16004
 declare -r ZKCLTPORT=2181
 declare -r ZK=zookeeper/shared   # name of Zookeeper cluster to use
+declare -r PIDFILE=/run/logdeviced.pid
 
 declare -r timeout=${2-60}
 declare -r deadline=$(($(date +%s)+$timeout))
@@ -91,8 +92,8 @@ case "${1-}" in
 	     exit 1
 	 fi
      done
-     if nc -z localhost $PORT_LD_COMMAND; then
-       >&2 echo "ERROR: LogDevice command port $PORT_LD_COMMAND is in use"
+     if nc -z localhost $PORT_LD_ADMIN; then
+       >&2 echo "ERROR: LogDevice admin port $PORT_LD_ADMIN is in use"
        exit 1
      fi
 
@@ -147,23 +148,19 @@ case "${1-}" in
      LD_LOAD_PLUGINS=lib/libldprometheus.so bin/logdeviced             \
           --config-path  ${zk}/conf/logdevice/${cluster_name}.conf     \
           --port $PORT_LD_CLIENT                                       \
-          --command-port $PORT_LD_COMMAND                              \
+          --admin-port $PORT_LD_ADMIN                                  \
           --prometheus-listen-addr 0.0.0.0:$LAB_PORT_PROMETHEUS_SCRAPE \
           --local-log-store-path=$LAB_DATADIR/                         \
 	  $LAB_ARGS &
      logdeviced_pid=$!
 
-     echo $logdeviced_pid > /run/logdeviced.pid
      while [[ $(date +%s) -le $deadline ]]; do
-       running=$(echo info | nc -N -w 10 localhost $PORT_LD_COMMAND |\
-                                                               grep '^PID')
-       if [[ $? -eq 0 ]]; then
-         if echo "$running" | grep -q $logdeviced_pid; then
-           exit 0
-         else
-           >&2 echo "ERROR: another logdeviced instance is already running"
-           exit 1
-         fi
+       if lsof -p $logdeviced_pid -i6tcp:$PORT_LD_ADMIN -a -sTCP:LISTEN \
+		 >/dev/null; then
+	 # Our logdeviced has been able to bind the admin port
+	 # Consider this a successful initialization.
+	 echo $logdeviced_pid > $PIDFILE
+         exit 0
        fi
        kill -0 $logdeviced_pid 2>/dev/null || exit 1
        sleep 2
@@ -172,13 +169,19 @@ case "${1-}" in
      ;;
 
    stop)
-     if echo quit | nc -N -w 10 localhost $PORT_LD_COMMAND; then
-       while [[ $(date +%s) -le $deadline ]] && \
-             nc -z localhost $PORT_LD_COMMAND; do
-         sleep 5
-       done
+     if [[ -r $PIDFILE ]]; then
+       logdeviced_pid=$(cat $PIDFILE)
+       if kill -TERM $logdeviced_pid; then
+         while [[ $(date +%s) -le $deadline ]] && \
+		   nc -z localhost $PORT_LD_ADMIN; do
+           sleep 2
+	 done
+       else
+	 echo "process $logdeviced_pid in $PIDFILE does not exist"
+       fi
+     else
+       echo "$PIDFILE not found or not readable"
      fi
-     exit 0
      ;;
 
    "") echo "Usage: logdevicedctl start|stop [timeout_seconds]"

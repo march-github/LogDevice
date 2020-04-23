@@ -1,0 +1,21 @@
+#!/bin/bash
+# -*-Shell-script-*-  This is a pre-install script for logdevice-service package
+
+set -uo pipefail
+shopt -s extglob
+
+DATADIR=/data
+cd $DATADIR || exit
+[[ -e NSHARDS ]] && exit # already initialized
+
+nshards=0
+
+# For each subdirectory in $DATADIR whose name is d<N> where <N>
+# is a number create a symlink shard<N>.
+for d in $(ls -d d+([[:digit:]]) 2>/dev/null); do
+    ln -sfn shard${d:1} $d && chown logdevice shard${d:1} $d || exit
+    ((nshards++))
+done
+
+# If any shards were found, write their number into NSHARDS.
+[[ $nshards -gt 0 ]] && echo $nshards > NSHARDS

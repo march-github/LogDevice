@@ -20,10 +20,32 @@ get_this_instance_az() {
 	 http://169.254.169.254/latest/meta-data/placement/availability-zone
 }
 
+# Output the value of 'cheaplab-cluster' tag of this instance, if such a
+# tag exists.
+#
+# @param  $1   region    name of AWS region where Zookeeper is running
+get_this_cluster_id() {
+    declare -r region=$1
+    local iid
+
+    iid=$(get_this_instance_id)
+    if [[ $? -ne 0 || -z $iid ]]; then
+	>&2 echo "ERROR: failed to get this instance id from EC2"
+	exit 1
+    fi
+
+    aws ec2 describe-instances \
+	--instance-ids=$iid    \
+	--region $region       \
+	--query                \
+ "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
+	--output text
+}
+
 # Output the list of internal ip addresses of all running or
 # starting EC2 instances with tag cheaplab-zk. If at least $MINZKUP
 # such instances are found, output a Zookeeper URL of the form
-# zk://<ip:port>{,<ip:port>} that ZK clients can user to contact the
+# zk://<ip:port>{,<ip:port>} that ZK clients can use to contact the
 # Zookeeper ensemble. Otherwise log an error to stderr and return failure.
 #
 # @param  $1   region    name of AWS region where Zookeeper ensemble is
@@ -56,29 +78,6 @@ get_zookeeper_url() {
 	echo -n ${sep}$ip:$ZKCLTPORT
 	sep=,
     done
-}
-
-
-# Output the value of 'cheaplab-cluster' tag of this instance, if such a
-# tag exists.
-#
-# @param  $1   region    name of AWS region where Zookeeper is running
-get_this_cluster_id() {
-    declare -r region=$1
-    local iid
-
-    iid=$(get_this_instance_id)
-    if [[ $? -ne 0 || -z $iid ]]; then
-	>&2 echo "ERROR: failed to get this instance id from EC2"
-	exit 1
-    fi
-
-    aws ec2 describe-instances \
-	--instance-ids=$iid    \
-	--region $region       \
-	--query                \
- "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
-	--output text
 }
 
 

@@ -3,88 +3,18 @@ set -uo pipefail
 
 declare -r PORT_LD_CLIENT=16001
 declare -r PORT_LD_ADMIN=16004
-declare -r ZKCLTPORT=2181
-declare -r ZK=zookeeper/shared   # name of Zookeeper cluster to use
+declare -r ZK=zookeeper/logdevice   # name of Zookeeper cluster to use
 declare -r PIDFILE=/run/logdeviced.pid
 
 declare -r timeout=${2-60}
 declare -r deadline=$(($(date +%s)+$timeout))
 
-
-get_this_instance_id() {
-    curl -sS -m 10 http://169.254.169.254/latest/meta-data/instance-id
-}
-
-get_this_instance_az() {
-    curl -sS -m 10 \
-	 http://169.254.169.254/latest/meta-data/placement/availability-zone
-}
-
-# Output the value of 'cheaplab-cluster' tag of this instance, if such a
-# tag exists.
-#
-# @param  $1   region    name of AWS region where Zookeeper is running
-get_this_cluster_id() {
-    declare -r region=$1
-    local iid
-
-    iid=$(get_this_instance_id)
-    if [[ $? -ne 0 || -z $iid ]]; then
-	>&2 echo "ERROR: failed to get this instance id from EC2"
-	exit 1
-    fi
-
-    aws ec2 describe-instances \
-	--instance-ids=$iid    \
-	--region $region       \
-	--query                \
- "Reservations[].Instances[].Tags[?contains(['cheaplab-cluster'],Key)].Value"\
-	--output text
-}
-
-# Output the list of internal ip addresses of all running or
-# starting EC2 instances with tag cheaplab-zk. If at least $MINZKUP
-# such instances are found, output a Zookeeper URL of the form
-# zk://<ip:port>{,<ip:port>} that ZK clients can use to contact the
-# Zookeeper ensemble. Otherwise log an error to stderr and return failure.
-#
-# @param  $1   region    name of AWS region where Zookeeper ensemble is
-#                        running (cross-region ensembles are not supported
-#                        yet)
-get_zookeeper_url() {
-    declare -r region=$1
-    declare -r MINZKUP=2  # minimum required number of running or starting
-                          # Zookeeper instances
-    local -a zkips
-
-    zkips=( $(aws ec2 describe-instances                                     \
-	--filters 'Name=tag-key,Values=cheaplab-zk'                          \
-	          'Name=instance-state-name,Values=running,starting'         \
-	--query "Reservations[].Instances[].[PrivateIpAddress]"              \
-	--region $region                                                     \
-	--output text) ) || return
-
-    if [[ ${#zkips[@]} -lt $MINZKUP ]]; then
-	>&2 echo "Too few Zookeeper EC2 instances in state 'running' or"\
-	    "'starting'. Expected $MINZKUP instances, got ${zkips[*]}"
-	return 1
-    fi
-
-    echo -n "zk:"
-
-    local ip
-    local sep=
-    for ip in ${zkips[@]}; do
-	echo -n ${sep}$ip:$ZKCLTPORT
-	sep=,
-    done
-}
-
+source ${LAB_PACKAGES_ROOT?}/cheaplib/current/cheaplib.sh || exit 1
 
 case "${1-}" in
    start)
-     for v in LAB_PACKAGES_ROOT LAB_DATADIR LAB_PORT_PROMETHEUS_SCRAPE\
-				  LAB_CLUSTER LAB_ARGS; do
+     for v in LAB_PACKAGES_ROOT LAB_DATADIR LAB_PORT_PROMETHEUS_SCRAPE LAB_ARGS;
+     do
 	 if [[ -z ${!v+_} ]]; then
 	     >&2 echo "ABORT: $v is not set in the environment."\
 		 "It was expected to be set by CheapLab."
@@ -113,32 +43,23 @@ case "${1-}" in
        exit 1
      fi
 
-     az=$(get_this_instance_az)
-     if [[ $? -ne 0 || -z $az ]]; then
-	 >&2 echo "ERROR: failed to get availability zone from EC2"
+     region=$(LAB-this_region) || exit
+
+     zk=$(LAB-zookeeper_url $ZK $region) || exit
+     if [[ -z $zk ]]; then
+	 >&2 echo "No nodes found for Zookeeper cluster $ZK"
 	 exit 1
      fi
-     region=${az:0:-1}  # drop last char
-     zk=$(get_zookeeper_url $region) || exit
 
-     cluster=$(get_this_cluster_id $region)
+     cluster=$(LAB-this_cluster_id $region)
      if [[ $? -ne 0 ]]; then
 	 >&2 echo "ERROR: failed to get cluster id"
 	 exit 1
-     elif [[ -z $cluster ]]; then
-	 >&2 echo "ERROR: could not determine cluster id because "\
-	     "cheaplab-cluster tag is missing or empty on this instance."
-	 exit 1
      elif [[ $cluster =~ ^logdevice/([[:alnum:]_]+)$ ]]; then
 	 cluster_name=${BASH_REMATCH[1]}
-         if [[ $cluster != $LAB_CLUSTER ]]; then
-	     >&2 echo "ABORT: cheaplab-cluster tag '$cluster' does not"\
-	     "match LAB_CLUSTER value '$LAB_CLUSTER' set in the environment."
-	     exit 1
-	 fi
 	 # fall through
      else
-	 >&2 echo "ERROR: unexpected cluster name $cluster."\
+	 >&2 echo "ERROR: invalid cluster name '$cluster'."\
 	     "Expected logdevice/[[:alnum:]_]+"
 	 exit 1
      fi

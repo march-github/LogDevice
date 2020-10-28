@@ -1,8 +1,13 @@
 #!/bin/bash
-# -*-Shell-script-*-  This is a pre-install script for logdevice-service package
+# -*-Shell-script-*-  This is a pre-install script for logdevice-service module
 
 set -uo pipefail
 shopt -s extglob
+
+declare -r INTERNAL_LOGS_COPYSET_SIZE=3  # up to the size of the cluster
+declare -r METADATA_LOGS_COPYSET_SIZE=5  # ditto
+declare -r INTERNAL_LOGS_NODESET_SIZE=11 # this applies both to internal logs
+                                         # and metadata logs
 
 DATADIR=/data
 cd $DATADIR || exit

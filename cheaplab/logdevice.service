@@ -8,8 +8,8 @@ StartLimitBurst=2
 [Service]
 Type=forking
 PIDFile=/run/logdeviced.pid
-ExecStart=/bin/bash ${LAB_PACKAGES_ROOT}/logdevice-service/current/logdevicedctl start
-ExecStop=/bin/bash ${LAB_PACKAGES_ROOT}/logdevice-service/current/logdevicedctl stop
+ExecStart=/bin/bash ${LAB_MODULES_ROOT}/logdevice-service/current/logdevicedctl start
+ExecStop=/bin/bash ${LAB_MODULES_ROOT}/logdevice-service/current/logdevicedctl stop
 StandardError=journal
 SyslogIdentifier=logdeviced
 RestartSec=5
